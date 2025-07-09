@@ -1,0 +1,19 @@
+{
+    "coin_name": "Coordinate",
+    "coin_shortcut": "CBTC",
+    "coin_label": "Coordinate",
+    "rpc_url": "http://10.38.1.235:18443",
+    "rpc_user": "marachain",
+    "rpc_pass": "marachain",
+    "rpc_timeout": 25,
+    "parse": false,
+    "message_queue_binding": "tcp://10.38.1.235:37000",
+    "subversion": "",
+    "address_format": "",
+    "xpub_magic": 76067358,
+    "slip44": 7,
+
+    "mempool_workers": 8,
+    "mempool_sub_workers": 2,
+    "block_addresses_to_keep": 300
+}
