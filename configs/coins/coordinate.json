@@ -1,0 +1,42 @@
+{
+    "coin": {
+        "name": "Coordinate",
+        "shortcut": "CBTC",
+        "label": "Coordinate",
+        "alias": "coordinate"
+    },
+    "ports": {
+        "backend_rpc": 18443,
+        "backend_message_queue": 37000,
+        "blockbook_internal": 9039,
+        "blockbook_public": 9139
+    },
+    "ipc": {
+        "rpc_url_template": "http://127.0.0.1:{{.Ports.BackendRPC}}",
+        "rpc_user": "marachain",
+        "rpc_pass": "marachain",
+        "rpc_timeout": 25,
+        "message_queue_binding_template": "tcp://127.0.0.1:{{.Ports.BackendMessageQueue}}"
+    },
+    "blockbook": {
+        "package_name": "blockbook-coordinate",
+        "system_user": "blockbook-coordinate",
+        "internal_binding_template": ":{{.Ports.BlockbookInternal}}",
+        "public_binding_template": ":{{.Ports.BlockbookPublic}}",
+        "explorer_url": "",
+        "additional_params": "",
+        "block_chain": {
+            "parse": true,
+            "mempool_workers": 8,
+            "mempool_sub_workers": 2,
+            "block_addresses_to_keep": 300,
+            "xpub_magic": 76067358,
+            "slip44": 7,
+            "additional_params": {}
+        }
+    },
+    "meta": {
+        "package_maintainer": "IT Admin",
+        "package_maintainer_email": "it@satoshilabs.com"
+    }
+}
