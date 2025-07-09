@@ -1,7 +1,7 @@
 ########################################
 # Stage 1: Build Environment
 ########################################
-FROM golang:1.20 AS builder
+FROM golang:1.24.4 AS builder
 
 # Set environment variables
 ENV GOPATH=/go
