@@ -1,72 +1,39 @@
-########################################
-# Stage 1: Build Environment
-########################################
-FROM golang:1.24.4 AS builder
+FROM ubuntu:22.04
 
-# Set environment variables
-ENV GOPATH=/go
-ENV PATH=$PATH:$GOPATH/bin
-ENV ROCKSDB_VERSION=v9.10.0
+LABEL maintainer="michael.casey@mara.com"
+LABEL version="0.01"
+LABEL description="Docker file for anduro governance"
 
-# Install required tools and libs
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Install dependencies if needed
 RUN apt-get update && apt-get install -y \
-    build-essential \
-    cmake \
-    git \
-    wget \
-    pkg-config \
-    lxc-dev \
-    libzmq3-dev \
-    libgflags-dev \
-    libsnappy-dev \
-    zlib1g-dev \
-    libbz2-dev \
-    libzstd-dev \
-    liblz4-dev \
-    libssl-dev \
-    curl \
-    ca-certificates \
-    && apt-get clean
+    build-essential git pkg-config libzmq3-dev \
+    libsnappy-dev zlib1g-dev libbz2-dev libzstd-dev liblz4-dev \
+    libssl-dev libgflags-dev lsb-release ca-certificates curl wget\
+    && rm -rf /var/lib/apt/lists/*
 
-# Download and build RocksDB
-RUN cd /opt && \
-    git clone --depth 1 -b $ROCKSDB_VERSION https://github.com/facebook/rocksdb.git && \
-    cd rocksdb && \
-    make -j4 shared_lib && \
-    make install-shared
+ENV GOLANG_VERSION=1.24.4
+RUN wget https://dl.google.com/go/go${GOLANG_VERSION}.linux-amd64.tar.gz && \
+    tar -C /usr/local -xzf go${GOLANG_VERSION}.linux-amd64.tar.gz && \
+    rm go${GOLANG_VERSION}.linux-amd64.tar.gz
+ENV PATH="/usr/local/go/bin:$PATH"
 
-# Copy blockbook source code
-WORKDIR /app
-COPY . .
+RUN cd /opt && git clone -b v9.10.0 --depth 1 https://github.com/facebook/rocksdb.git
+RUN cd /opt/rocksdb && CFLAGS=-fPIC CXXFLAGS=-fPIC PORTABLE=0 DISABLE_WARNING_AS_ERROR=1 make -j 4 release
 
-# Set CGO flags to include RocksDB
-ENV CGO_CFLAGS="-I/usr/local/include"
-ENV CGO_LDFLAGS="-L/usr/local/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd"
-
-# Build blockbook binary
-RUN go build -o build/blockbook .
-
-########################################
-# Stage 2: Runtime Image
-########################################
-FROM debian:bullseye-slim
-
-# Install required runtime dependencies
-RUN apt-get update && apt-get install -y \
-    libsnappy1v5 \
-    liblz4-1 \
-    libzstd1 \
-    libgflags2.2 \
-    libzmq5 \
-    libssl1.1 \
-    ca-certificates \
-    && apt-get clean
+# Set RocksDB environment flags (optional)
+ENV CGO_CFLAGS="-I/opt/rocksdb/include"
+ENV CGO_LDFLAGS="-L/opt/rocksdb -ldl -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd"
 
 # Set working directory
 WORKDIR /blockbook
 
-# Copy built binary from builder
-COPY --from=builder /app/build/blockbook /usr/local/bin/blockbook
+# Copy source code
+COPY . .
+
+# Build blockbook binary
+RUN go build -o /usr/local/bin/blockbook
 
 # Run blockbook by default
 ENTRYPOINT ["blockbook"]
