@@ -33,11 +33,11 @@ func init() {
 	MainNetParams.Net = MainnetMagic
 	MainNetParams.Bech32HRPSegwit = "ccrt"
 
-	TestNetParams = chaincfg.TestNetParams
+	TestNetParams = chaincfg.TestNet3Params
 	TestNetParams.Net = TestnetMagic
 	TestNetParams.Bech32HRPSegwit = "tc"
 
-	RegtestParams = chaincfg.RegtestParams
+	RegtestParams = chaincfg.RegressionNetParams
 	RegtestParams.Net = RegtestMagic
 	RegtestParams.Bech32HRPSegwit = "cc"
 }
