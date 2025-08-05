@@ -88,7 +88,6 @@ func (b *CoordinateRPC) Initialize() error {
 
 // GetBlock returns block with given hash.
 func (b *CoordinateRPC) GetBlock(hash string, height uint32) (*bchain.Block, error) {
-	glog.Warningf("GetBlock test 1")
 	var err error
 	if hash == "" {
 		hash, err = b.GetBlockHash(height)
@@ -111,7 +110,6 @@ func IsErrBlockNotFound(err *bchain.RPCError) bool {
 
 // GetBlockFull returns block with given hash
 func (b *CoordinateRPC) GetBlockFull(hash string) (*bchain.Block, error) {
-	glog.Warningf("GetBlockFull test 1")
 	glog.V(1).Info("rpc: getblock (verbosity=2) ", hash)
 
 	res := ResGetBlockFull{}
@@ -145,7 +143,6 @@ func (b *CoordinateRPC) GetBlockFull(hash string) (*bchain.Block, error) {
 			vout.JsonValue = ""
 		}
 	}
-
 	return &res.Result, nil
 }
 
@@ -179,7 +176,6 @@ func (b *CoordinateRPC) getRawTransaction(txid string) (json.RawMessage, error) 
 
 // GetTransaction returns a transaction by the transaction ID
 func (b *CoordinateRPC) GetTransaction(txid string) (*bchain.Tx, error) {
-	glog.Warningf("GetTransaction test 1")
 	r, err := b.getRawTransaction(txid)
 	if err != nil {
 		return nil, err
