@@ -12,9 +12,14 @@ import (
 	"github.com/trezor/blockbook/bchain/coins/btc"
 )
 
+  pchMessageStart[0] = 0xf8;
+        pchMessageStart[1] = 0xbf;
+        pchMessageStart[2] = 0xb8;
+        pchMessageStart[3] = 0xd8;
+
 const (
 	// MainnetMagic is mainnet network constant
-	MainnetMagic wire.BitcoinNet = 0xf8beb9d8
+	MainnetMagic wire.BitcoinNet = 0xf8bfb8d8
 )
 
 var (
@@ -25,7 +30,7 @@ var (
 func init() {
 	MainNetParams = chaincfg.MainNetParams
 	MainNetParams.Net = MainnetMagic
-	MainNetParams.Bech32HRPSegwit = "tc"
+	MainNetParams.Bech32HRPSegwit = "ccrt"
 }
 
 // CoordinateParser handle
