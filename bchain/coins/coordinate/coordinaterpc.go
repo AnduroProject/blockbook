@@ -65,8 +65,6 @@ func (b *CoordinateRPC) Initialize() error {
 		return err
 	}
 	chainName := ci.Chain
-
-	glog.Info("Chain name ", chainName)
 	params := GetChainParams(chainName)
 
 	// always create parser

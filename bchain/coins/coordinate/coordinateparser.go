@@ -12,35 +12,47 @@ import (
 	"github.com/trezor/blockbook/bchain/coins/btc"
 )
 
-  pchMessageStart[0] = 0xf8;
-        pchMessageStart[1] = 0xbf;
-        pchMessageStart[2] = 0xb8;
-        pchMessageStart[3] = 0xd8;
-
 const (
 	// MainnetMagic is mainnet network constant
 	MainnetMagic wire.BitcoinNet = 0xf8bfb8d8
+	// TestnetMagic is testnet network constant
+	TestnetMagic wire.BitcoinNet = 0xb9beb9d8
+	// RegtestMagic is regtest network constant
+	RegtestMagic wire.BitcoinNet = 0xf8bfb8d8
 )
 
 var (
 	// MainNetParams are parser parameters for mainnet
 	MainNetParams chaincfg.Params
+	// TestNetParams are parser parameters for testnet
+	TestNetParams chaincfg.Params
+	// RegtestParams are parser parameters for regtest
+	RegtestParams chaincfg.Params
 )
 
 func init() {
 	MainNetParams = chaincfg.MainNetParams
 	MainNetParams.Net = MainnetMagic
-	MainNetParams.Bech32HRPSegwit = "ccrt"
+	MainNetParams.Bech32HRPSegwit = "cc"
+
+	TestNetParams = chaincfg.TestNet3Params
+	TestNetParams.Net = TestnetMagic
+	TestNetParams.Bech32HRPSegwit = "tc"
+
+	RegtestParams = chaincfg.RegressionNetParams
+	RegtestParams.Net = RegtestMagic
+	RegtestParams.Bech32HRPSegwit = "ccrt"
 }
 
 // CoordinateParser handle
 type CoordinateParser struct {
 	*btc.BitcoinLikeParser
+	baseparser *bchain.BaseParser
 }
 
 // NewCoordinateParser returns new CoordinateParser instance
 func NewCoordinateParser(params *chaincfg.Params, c *btc.Configuration) *CoordinateParser {
-	p := &CoordinateParser{BitcoinLikeParser: btc.NewBitcoinLikeParser(params, c)}
+	p := &CoordinateParser{BitcoinLikeParser: btc.NewBitcoinLikeParser(params, c), baseparser: &bchain.BaseParser{}}
 	p.VSizeSupport = true
 	return p
 }
@@ -48,52 +60,27 @@ func NewCoordinateParser(params *chaincfg.Params, c *btc.Configuration) *Coordin
 // GetChainParams contains network parameters for the main Namecoin network,
 // and the test Namecoin network
 func GetChainParams(chain string) *chaincfg.Params {
-	if !chaincfg.IsRegistered(&MainNetParams) {
-		err := chaincfg.Register(&MainNetParams)
-		if err != nil {
+	var param *chaincfg.Params
+
+	switch chain {
+	case "regtest":
+		param = &RegtestParams
+	case "test":
+		param = &TestNetParams
+	default:
+		param = &MainNetParams
+	}
+	glog.Info("Chain name 0", chain)
+	if !chaincfg.IsRegistered(param) {
+		glog.Info("Chain name 1", chain)
+		if err := chaincfg.Register(param); err != nil {
+			glog.Info("Chain name 2", chain)
 			panic(err)
 		}
 	}
-	switch chain {
-	default:
-		return &MainNetParams
-	}
+	glog.Info("Chain name 3", chain)
+	return param
 }
-
-// // ParseBlock parses raw block to our Block struct
-// // it has special handling for Auxpow blocks that cannot be parsed by standard btc wire parser
-// func (p *CoordinateParser) ParseBlock(b []byte) (*bchain.Block, error) {
-// 	r := bytes.NewReader(b)
-// 	w := wire.MsgBlock{}
-// 	h := wire.BlockHeader{}
-// 	err := h.Deserialize(r)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	if (h.Version & utils.VersionAuxpow) != 0 {
-// 		if err = utils.SkipAuxpow(r); err != nil {
-// 			return nil, err
-// 		}
-// 	}
-
-// 	err = utils.DecodeTransactions(r, 0, wire.WitnessEncoding, &w)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-
-// 	txs := make([]bchain.Tx, len(w.Transactions))
-// 	for ti, t := range w.Transactions {
-// 		txs[ti] = p.TxFromMsgTx(t, false)
-// 	}
-
-// 	return &bchain.Block{
-// 		BlockHeader: bchain.BlockHeader{
-// 			Size: len(b),
-// 			Time: h.Timestamp.Unix(),
-// 		},
-// 		Txs: txs,
-// 	}, nil
-// }
 
 // ScriptPubKey contains data about output script
 type ScriptPubKey struct {
