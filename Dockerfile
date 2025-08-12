@@ -40,23 +40,9 @@ ENV CGO_LDFLAGS="-L/opt/rocksdb -lrocksdb -lstdc++ -lm -ldl -lz -lbz2 -lsnappy -
 WORKDIR /src
 # If you build your fork from context:
 COPY . .
-# Prefer the project Makefile if present (builds C++ helpers correctly)
-# Fallback to go build if no Makefile is available.
-RUN if [ -f Makefile ]; then make clean && make; else go build -o /usr/local/bin/blockbook ./...; fi
 
-# ---------- runtime stage ----------
-FROM ubuntu:22.04
+# Build blockbook binary
+RUN go build -o /usr/local/bin/blockbook
 
-# Minimal runtime libs needed by RocksDB/Blockbook
-RUN apt-get update && apt-get install -y \
-    ca-certificates libzstd1 liblz4-1 zlib1g libbz2-1.0 libsnappy1v5 libgflags2.2 \
- && rm -rf /var/lib/apt/lists/*
-
-# Copy rocksdb shared objects (and libstdc++) if needed
-COPY --from=build /opt/rocksdb/librocksdb.* /usr/lib/
-# Copy the built binary (adjust path if built via Makefile)
-COPY --from=build /usr/local/bin/blockbook /usr/local/bin/blockbook 2>/dev/null || true
-# If Makefile built to ./build/bin/blockbook, copy it:
-COPY --from=build /src/build/bin/blockbook /usr/local/bin/blockbook 2>/dev/null || true
-
-ENTRYPOINT ["/usr/local/bin/blockbook"]
+# Run blockbook by default
+ENTRYPOINT ["blockbook"]
