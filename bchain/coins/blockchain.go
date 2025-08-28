@@ -58,6 +58,7 @@ import (
 	"github.com/trezor/blockbook/bchain/coins/viacoin"
 	"github.com/trezor/blockbook/bchain/coins/vipstarcoin"
 	"github.com/trezor/blockbook/bchain/coins/zec"
+	"github.com/trezor/blockbook/bchain/coins/coordinate"
 	"github.com/trezor/blockbook/common"
 )
 
@@ -150,6 +151,7 @@ func init() {
 	BlockChainFactories["Arbitrum Nova Archive"] = arbitrum.NewArbitrumRPC
 	BlockChainFactories["Base"] = base.NewBaseRPC
 	BlockChainFactories["Base Archive"] = base.NewBaseRPC
+	BlockChainFactories["Coordinate"] = coordinate.NewCoordinateRPC
 }
 
 // NewBlockChain creates bchain.BlockChain and bchain.Mempool for the coin passed by the parameter coin
