@@ -35,7 +35,12 @@ Good examples of coin configuration are
     * `blockbook_public` – Blockbook's public port that is used to communicate with Trezor wallet (via Socket.IO).
 
 * `ipc` – Defines how Blockbook connects its back-end service.
-    * `rpc_url_template` – Template that defines URL of back-end RPC service. See note on templates below.
+    * `rpc_url_template` – Template that defines URL of back-end RPC service. See note on templates below. You can
+      override it at build time by setting `BB_RPC_URL_HTTP_<coin alias>` (for example,
+      `BB_RPC_URL_HTTP_ethereum=http://backend_hostname:1234`), which is used as-is during template generation.
+    * `rpc_url_ws_template` – Template that defines URL of back-end WebSocket RPC service for subscriptions. You can
+      override it at build time by setting `BB_RPC_URL_WS_<coin alias>` and it should point to the same host as
+      `rpc_url_template`.
     * `rpc_user` – User name of back-end RPC service, used by both Blockbook and back-end configuration templates.
     * `rpc_pass` – Password of back-end RPC service, used by both Blockbook and back-end configuration templates.
     * `rpc_timeout` – RPC timeout used by Blockbook.
@@ -102,6 +107,9 @@ are also templates and are executed inside base template. Use `{{.path}}` syntax
 where *.path* can be for example *.Blockbook.BlockChain.Parse*. Go uses CamelCase notation so references inside templates
 as well. Note that dot at the beginning is mandatory. Go template syntax is fully documented
 [here](https://godoc.org/text/template).
+
+Backend templates may also reference `.Env.RPCBindHost` and `.Env.RPCAllowIP`, which are derived at build time from
+`BB_RPC_BIND_HOST_<coin alias>` and `BB_RPC_ALLOW_IP_<coin alias>` to keep RPC exposure explicit and controlled.
 
 ## Built-in text
 

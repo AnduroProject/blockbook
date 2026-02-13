@@ -82,6 +82,8 @@ func init() {
 	BlockChainFactories["Ethereum Testnet Sepolia Archive"] = eth.NewEthereumRPC
 	BlockChainFactories["Ethereum Testnet Holesky"] = eth.NewEthereumRPC
 	BlockChainFactories["Ethereum Testnet Holesky Archive"] = eth.NewEthereumRPC
+	BlockChainFactories["Ethereum Testnet Hoodi"] = eth.NewEthereumRPC
+	BlockChainFactories["Ethereum Testnet Hoodi Archive"] = eth.NewEthereumRPC
 	BlockChainFactories["Bcash"] = bch.NewBCashRPC
 	BlockChainFactories["Bcash Testnet"] = bch.NewBCashRPC
 	BlockChainFactories["Bgold"] = btg.NewBGoldRPC
@@ -304,9 +306,9 @@ func (c *blockChainWithMetrics) LongTermFeeRate() (v *bchain.LongTermFeeRate, er
 	return c.b.LongTermFeeRate()
 }
 
-func (c *blockChainWithMetrics) SendRawTransaction(tx string) (v string, err error) {
+func (c *blockChainWithMetrics) SendRawTransaction(tx string, disableAlternativeRPC bool) (v string, err error) {
 	defer func(s time.Time) { c.observeRPCLatency("SendRawTransaction", s, err) }(time.Now())
-	return c.b.SendRawTransaction(tx)
+	return c.b.SendRawTransaction(tx, disableAlternativeRPC)
 }
 
 func (c *blockChainWithMetrics) GetMempoolEntry(txid string) (v *bchain.MempoolEntry, err error) {
@@ -346,6 +348,11 @@ func (c *blockChainWithMetrics) GetContractInfo(contractDesc bchain.AddressDescr
 func (c *blockChainWithMetrics) EthereumTypeGetErc20ContractBalance(addrDesc, contractDesc bchain.AddressDescriptor) (v *big.Int, err error) {
 	defer func(s time.Time) { c.observeRPCLatency("EthereumTypeGetErc20ContractBalance", s, err) }(time.Now())
 	return c.b.EthereumTypeGetErc20ContractBalance(addrDesc, contractDesc)
+}
+
+func (c *blockChainWithMetrics) EthereumTypeGetErc20ContractBalances(addrDesc bchain.AddressDescriptor, contractDescs []bchain.AddressDescriptor) (v []*big.Int, err error) {
+	defer func(s time.Time) { c.observeRPCLatency("EthereumTypeGetErc20ContractBalances", s, err) }(time.Now())
+	return c.b.EthereumTypeGetErc20ContractBalances(addrDesc, contractDescs)
 }
 
 // GetTokenURI returns URI of non fungible or multi token defined by token id

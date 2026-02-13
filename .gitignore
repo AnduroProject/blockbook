@@ -16,3 +16,4 @@ build/*.deb
 .deb-image
 \.idea/
 __debug*
+.gocache/

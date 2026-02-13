@@ -74,6 +74,11 @@ func (b *BaseChain) EthereumTypeGetErc20ContractBalance(addrDesc, contractDesc A
 	return nil, errors.New("not supported")
 }
 
+// EthereumTypeGetErc20ContractBalances is not supported
+func (b *BaseChain) EthereumTypeGetErc20ContractBalances(addrDesc AddressDescriptor, contractDescs []AddressDescriptor) ([]*big.Int, error) {
+	return nil, errors.New("not supported")
+}
+
 // GetTokenURI returns URI of non fungible or multi token defined by token id
 func (p *BaseChain) GetTokenURI(contractDesc AddressDescriptor, tokenID *big.Int) (string, error) {
 	return "", errors.New("not supported")

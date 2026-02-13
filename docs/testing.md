@@ -7,6 +7,7 @@ distinguish which tests should be executed.
 There are several ways to run tests:
 
 * `make test` – run unit tests only (note that `make deb*` and `make all*` commands always run also *test* target)
+* `make test-connectivity` – run connectivity checks only
 * `make test-integration` – run integration tests only
 * `make test-all` – run all tests above
 
@@ -39,6 +40,8 @@ are able to run. That is done in test definition file *blockbook/tests/tests.jso
 test implementations call each level as separate subtest. Go's *test* command allows filter tests to run by `-run` flag.
 It perfectly fits with layered test definitions. For example, you can:
 
+* run connectivity tests for all coins – `make test-connectivity`
+* run connectivity tests for a single coin – `make test-connectivity ARGS="-run=TestIntegration/bitcoin=main/connectivity"`
 * run tests for single coin – `make test-integration ARGS="-run=TestIntegration/bitcoin/"`
 * run single test suite – `make test-integration ARGS="-run=TestIntegration//sync/"`
 * run single test – `make test-integration ARGS="-run=TestIntegration//sync/HandleFork"`
@@ -52,9 +55,33 @@ For simplicity, URLs and credentials of back-end services, where are tests going
 from *blockbook/configs/coins*, the same place from where are production configuration files generated. There are general
 URLs that link to *localhost*. If you need run tests against remote servers, there are few options how to do it:
 
+* set `BB_RPC_URL_HTTP_<coin alias>` to override `rpc_url_template` during template generation (forwarded into Docker by the root `Makefile`)
+* set `BB_RPC_URL_WS_<coin alias>` to override `rpc_url_ws_template` for WebSocket subscriptions when needed
 * temporarily change config
 * SSH tunneling – `ssh -nNT -L 8030:localhost:8030 remote-server`
 * HTTP proxy
+
+### Connectivity integration tests
+
+Connectivity tests are lightweight checks that verify back-end availability before running heavier RPC or sync suites.
+They are configured per coin in *blockbook/tests/tests.json* using the `connectivity` list:
+
+* `["http"]` – verify HTTP RPC connectivity
+* `["http", "ws"]` – verify HTTP RPC plus WebSocket subscription connectivity
+
+Example:
+
+```
+"bitcoin": {
+    "connectivity": ["http"]
+},
+"ethereum": {
+    "connectivity": ["http", "ws"]
+}
+```
+
+HTTP connectivity for UTXO chains calls `getblockchaininfo`. For EVM chains it calls `web3_clientVersion`. WebSocket
+connectivity validates `web3_clientVersion` and opens a `newHeads` subscription.
 
 ### Synchronization integration tests
 

@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,7 +35,11 @@ const (
 	TestNetSepolia Network = 11155111
 	// TestNetHolesky is Holesky test network
 	TestNetHolesky Network = 17000
+	// TestNetHoodi is Hoodi test network
+	TestNetHoodi Network = 560048
 )
+
+const defaultErc20BatchSize = 100
 
 // Configuration represents json config file
 type Configuration struct {
@@ -42,7 +47,9 @@ type Configuration struct {
 	CoinShortcut                    string `json:"coin_shortcut"`
 	Network                         string `json:"network"`
 	RPCURL                          string `json:"rpc_url"`
+	RPCURLWS                        string `json:"rpc_url_ws"`
 	RPCTimeout                      int    `json:"rpc_timeout"`
+	Erc20BatchSize                  int    `json:"erc20_batch_size,omitempty"`
 	BlockAddressesToKeep            int    `json:"block_addresses_to_keep"`
 	AddressAliases                  bool   `json:"address_aliases,omitempty"`
 	MempoolTxTimeoutHours           int    `json:"mempoolTxTimeoutHours"`
@@ -59,18 +66,22 @@ type Configuration struct {
 // EthereumRPC is an interface to JSON-RPC eth service.
 type EthereumRPC struct {
 	*bchain.BaseChain
-	Client                    bchain.EVMClient
-	RPC                       bchain.EVMRPCClient
-	MainNetChainID            Network
-	Timeout                   time.Duration
-	Parser                    *EthereumParser
-	PushHandler               func(bchain.NotificationType)
-	OpenRPC                   func(string) (bchain.EVMRPCClient, bchain.EVMClient, error)
-	Mempool                   *bchain.MempoolEthereumType
-	mempoolInitialized        bool
-	bestHeaderLock            sync.Mutex
-	bestHeader                bchain.EVMHeader
-	bestHeaderTime            time.Time
+	Client             bchain.EVMClient
+	RPC                bchain.EVMRPCClient
+	MainNetChainID     Network
+	Timeout            time.Duration
+	Parser             *EthereumParser
+	PushHandler        func(bchain.NotificationType)
+	OpenRPC            func(string, string) (bchain.EVMRPCClient, bchain.EVMClient, error)
+	Mempool            *bchain.MempoolEthereumType
+	mempoolInitialized bool
+	bestHeaderLock     sync.Mutex
+	bestHeader         bchain.EVMHeader
+	bestHeaderTime     time.Time
+	// newBlockNotifyCh coalesces bursts of newHeads events into a single wake-up.
+	// This keeps the subscription reader unblocked while we refresh the canonical tip.
+	newBlockNotifyCh          chan struct{}
+	newBlockNotifyOnce        sync.Once
 	NewBlock                  bchain.EVMNewBlockSubscriber
 	newBlockSubscription      bchain.EVMClientSubscription
 	NewTx                     bchain.EVMNewTxSubscriber
@@ -98,11 +109,16 @@ func NewEthereumRPC(config json.RawMessage, pushHandler func(bchain.Notification
 	if c.BlockAddressesToKeep < 100 {
 		c.BlockAddressesToKeep = 100
 	}
+	if c.Erc20BatchSize <= 0 {
+		c.Erc20BatchSize = defaultErc20BatchSize
+	}
 
 	s := &EthereumRPC{
 		BaseChain:   &bchain.BaseChain{},
 		ChainConfig: &c,
 	}
+	// 1-slot buffer ensures we only queue one "refresh tip" signal at a time.
+	s.newBlockNotifyCh = make(chan struct{}, 1)
 
 	ProcessInternalTransactions = c.ProcessInternalTransactions
 
@@ -111,43 +127,110 @@ func NewEthereumRPC(config json.RawMessage, pushHandler func(bchain.Notification
 	s.Timeout = time.Duration(c.RPCTimeout) * time.Second
 	s.PushHandler = pushHandler
 
-	if s.ChainConfig.AlternativeEstimateFee == "1inch" {
-		if s.alternativeFeeProvider, err = NewOneInchFeesProvider(s, s.ChainConfig.AlternativeEstimateFeeParams); err != nil {
-			glog.Error("New1InchFeesProvider error ", err, " Reverting to default estimateFee functionality")
-			// disable AlternativeEstimateFee logic
-			s.alternativeFeeProvider = nil
-		}
-	} else if s.ChainConfig.AlternativeEstimateFee == "infura" {
-		if s.alternativeFeeProvider, err = NewInfuraFeesProvider(s, s.ChainConfig.AlternativeEstimateFeeParams); err != nil {
-			glog.Error("NewInfuraFeesProvider error ", err, " Reverting to default estimateFee functionality")
-			// disable AlternativeEstimateFee logic
-			s.alternativeFeeProvider = nil
-		}
-	}
-	if s.alternativeFeeProvider != nil {
-		glog.Info("Using alternative fee provider ", s.ChainConfig.AlternativeEstimateFee)
-	}
-
-	network := c.Network
-	if network == "" {
-		network = c.CoinShortcut
-	}
-
-	s.alternativeSendTxProvider = NewAlternativeSendTxProvider(network, c.RPCTimeout, c.MempoolTxTimeoutHours)
-
 	return s, nil
 }
 
-// OpenRPC opens RPC connection to ETH backend
-var OpenRPC = func(url string) (bchain.EVMRPCClient, bchain.EVMClient, error) {
+// EnsureSameRPCHost validates that both RPC URLs point to the same host.
+func EnsureSameRPCHost(httpURL, wsURL string) error {
+	if httpURL == "" || wsURL == "" {
+		return nil
+	}
+	httpHost, err := rpcURLHost(httpURL)
+	if err != nil {
+		return errors.Annotatef(err, "rpc_url")
+	}
+	wsHost, err := rpcURLHost(wsURL)
+	if err != nil {
+		return errors.Annotatef(err, "rpc_url_ws")
+	}
+	if !strings.EqualFold(httpHost, wsHost) {
+		return errors.Errorf("rpc_url host %q and rpc_url_ws host %q must match", httpHost, wsHost)
+	}
+	return nil
+}
+
+// NormalizeRPCURLs validates HTTP and WS RPC endpoints and enforces same-host rules.
+func NormalizeRPCURLs(httpURL, wsURL string) (string, string, error) {
+	callURL := strings.TrimSpace(httpURL)
+	subURL := strings.TrimSpace(wsURL)
+	if callURL == "" {
+		return "", "", errors.New("rpc_url is empty")
+	}
+	if subURL == "" {
+		return "", "", errors.New("rpc_url_ws is empty")
+	}
+	if err := validateRPCURLScheme(callURL, "rpc_url", []string{"http", "https"}); err != nil {
+		return "", "", err
+	}
+	if err := validateRPCURLScheme(subURL, "rpc_url_ws", []string{"ws", "wss"}); err != nil {
+		return "", "", err
+	}
+	if err := EnsureSameRPCHost(callURL, subURL); err != nil {
+		return "", "", err
+	}
+	return callURL, subURL, nil
+}
+
+func validateRPCURLScheme(rawURL, field string, allowedSchemes []string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return errors.Annotatef(err, "%s", field)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme == "" {
+		return errors.Errorf("%s missing scheme in %q", field, rawURL)
+	}
+	for _, allowed := range allowedSchemes {
+		if scheme == allowed {
+			return nil
+		}
+	}
+	return errors.Errorf("%s must use %s scheme: %q", field, strings.Join(allowedSchemes, " or "), rawURL)
+}
+
+func rpcURLHost(rawURL string) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return "", errors.Errorf("missing host in %q", rawURL)
+	}
+	return host, nil
+}
+
+func dialRPC(rawURL string) (*rpc.Client, error) {
+	if rawURL == "" {
+		return nil, errors.New("empty rpc url")
+	}
 	opts := []rpc.ClientOption{}
-	opts = append(opts, rpc.WithWebsocketMessageSizeLimit(0))
-	r, err := rpc.DialOptions(context.Background(), url, opts...)
+	if strings.HasPrefix(rawURL, "ws://") || strings.HasPrefix(rawURL, "wss://") {
+		opts = append(opts, rpc.WithWebsocketMessageSizeLimit(0))
+	}
+	return rpc.DialOptions(context.Background(), rawURL, opts...)
+}
+
+// OpenRPC opens RPC connection to ETH backend.
+var OpenRPC = func(httpURL, wsURL string) (bchain.EVMRPCClient, bchain.EVMClient, error) {
+	callURL, subURL, err := NormalizeRPCURLs(httpURL, wsURL)
 	if err != nil {
 		return nil, nil, err
 	}
-	rc := &EthereumRPCClient{Client: r}
-	ec := &EthereumClient{Client: ethclient.NewClient(r)}
+	callClient, err := dialRPC(callURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	subClient := callClient
+	if subURL != callURL {
+		subClient, err = dialRPC(subURL)
+		if err != nil {
+			callClient.Close()
+			return nil, nil, err
+		}
+	}
+	rc := &DualRPCClient{CallClient: callClient, SubClient: subClient}
+	ec := &EthereumClient{Client: ethclient.NewClient(callClient)}
 	return rc, ec, nil
 }
 
@@ -155,7 +238,7 @@ var OpenRPC = func(url string) (bchain.EVMRPCClient, bchain.EVMClient, error) {
 func (b *EthereumRPC) Initialize() error {
 	b.OpenRPC = OpenRPC
 
-	rc, ec, err := b.OpenRPC(b.ChainConfig.RPCURL)
+	rc, ec, err := b.OpenRPC(b.ChainConfig.RPCURL, b.ChainConfig.RPCURLWS)
 	if err != nil {
 		return err
 	}
@@ -186,6 +269,9 @@ func (b *EthereumRPC) Initialize() error {
 	case TestNetHolesky:
 		b.Testnet = true
 		b.Network = "holesky"
+	case TestNetHoodi:
+		b.Testnet = true
+		b.Network = "hoodi"
 	default:
 		return errors.Errorf("Unknown network id %v", id)
 	}
@@ -195,9 +281,22 @@ func (b *EthereumRPC) Initialize() error {
 		return err
 	}
 
+	b.InitAlternativeProviders()
+
 	glog.Info("rpc: block chain ", b.Network)
 
 	return nil
+}
+
+// InitAlternativeProviders initializes alternative providers
+func (b *EthereumRPC) InitAlternativeProviders() {
+	b.initAlternativeFeeProvider()
+
+	network := b.ChainConfig.Network
+	if network == "" {
+		network = b.ChainConfig.CoinShortcut
+	}
+	b.alternativeSendTxProvider = NewAlternativeSendTxProvider(network, b.ChainConfig.RPCTimeout, b.ChainConfig.MempoolTxTimeoutHours)
 }
 
 // CreateMempool creates mempool if not already created, however does not initialize it
@@ -249,16 +348,17 @@ func (b *EthereumRPC) InitializeMempool(addrDescForOutpoint bchain.AddrDescForOu
 }
 
 func (b *EthereumRPC) subscribeEvents() error {
+	b.newBlockNotifyOnce.Do(func() {
+		go b.newBlockNotifier()
+	})
 	// new block notifications handling
 	go func() {
 		for {
-			h, ok := b.NewBlock.Read()
+			_, ok := b.NewBlock.Read()
 			if !ok {
 				break
 			}
-			b.UpdateBestHeader(h)
-			// notify blockbook
-			b.PushHandler(bchain.NotificationNewBlock)
+			b.signalNewBlock()
 		}
 	}()
 
@@ -359,6 +459,27 @@ func (b *EthereumRPC) subscribe(f func() (bchain.EVMClientSubscription, error)) 
 	return nil
 }
 
+func (b *EthereumRPC) initAlternativeFeeProvider() {
+	var err error
+	if b.ChainConfig.AlternativeEstimateFee == "1inch" {
+		if b.alternativeFeeProvider, err = NewOneInchFeesProvider(b, b.ChainConfig.AlternativeEstimateFeeParams); err != nil {
+			glog.Error("New1InchFeesProvider error ", err, " Reverting to default estimateFee functionality")
+			// disable AlternativeEstimateFee logic
+			b.alternativeFeeProvider = nil
+		}
+	} else if b.ChainConfig.AlternativeEstimateFee == "infura" {
+		if b.alternativeFeeProvider, err = NewInfuraFeesProvider(b, b.ChainConfig.AlternativeEstimateFeeParams); err != nil {
+			glog.Error("NewInfuraFeesProvider error ", err, " Reverting to default estimateFee functionality")
+			// disable AlternativeEstimateFee logic
+			b.alternativeFeeProvider = nil
+		}
+	}
+	if b.alternativeFeeProvider != nil {
+		glog.Info("Using alternative fee provider ", b.ChainConfig.AlternativeEstimateFee)
+	}
+
+}
+
 func (b *EthereumRPC) closeRPC() {
 	if b.newBlockSubscription != nil {
 		b.newBlockSubscription.Unsubscribe()
@@ -374,7 +495,7 @@ func (b *EthereumRPC) closeRPC() {
 func (b *EthereumRPC) reconnectRPC() error {
 	glog.Info("Reconnecting RPC")
 	b.closeRPC()
-	rc, ec, err := b.OpenRPC(b.ChainConfig.RPCURL)
+	rc, ec, err := b.OpenRPC(b.ChainConfig.RPCURL, b.ChainConfig.RPCURLWS)
 	if err != nil {
 		return err
 	}
@@ -494,11 +615,69 @@ func (b *EthereumRPC) getBestHeader() (bchain.EVMHeader, error) {
 
 // UpdateBestHeader keeps track of the latest block header confirmed on chain
 func (b *EthereumRPC) UpdateBestHeader(h bchain.EVMHeader) {
-	glog.V(2).Info("rpc: new block header ", h.Number())
+	if h == nil || h.Number() == nil {
+		return
+	}
+	glog.V(2).Info("rpc: new block header ", h.Number().Uint64())
+	b.setBestHeader(h)
+}
+
+func (b *EthereumRPC) signalNewBlock() {
+	// Non-blocking send: one pending signal is enough to refresh the tip.
+	select {
+	case b.newBlockNotifyCh <- struct{}{}:
+	default:
+	}
+}
+
+func (b *EthereumRPC) newBlockNotifier() {
+	for range b.newBlockNotifyCh {
+		updated, err := b.refreshBestHeaderFromChain()
+		if err != nil {
+			glog.Error("refreshBestHeaderFromChain ", err)
+			continue
+		}
+		if updated {
+			b.PushHandler(bchain.NotificationNewBlock)
+		}
+	}
+}
+
+func (b *EthereumRPC) refreshBestHeaderFromChain() (bool, error) {
+	if b.Client == nil {
+		return false, errors.New("rpc client not initialized")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), b.Timeout)
+	defer cancel()
+	h, err := b.Client.HeaderByNumber(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	if h == nil || h.Number() == nil {
+		return false, errors.New("best header is nil")
+	}
+	return b.setBestHeader(h), nil
+}
+
+func (b *EthereumRPC) setBestHeader(h bchain.EVMHeader) bool {
+	if h == nil || h.Number() == nil {
+		return false
+	}
 	b.bestHeaderLock.Lock()
+	defer b.bestHeaderLock.Unlock()
+	changed := false
+	if b.bestHeader == nil || b.bestHeader.Number() == nil {
+		changed = true
+	} else {
+		prevNum := b.bestHeader.Number().Uint64()
+		newNum := h.Number().Uint64()
+		if prevNum != newNum || b.bestHeader.Hash() != h.Hash() {
+			changed = true
+		}
+	}
 	b.bestHeader = h
 	b.bestHeaderTime = time.Now()
-	b.bestHeaderLock.Unlock()
+	return changed
 }
 
 // GetBestBlockHash returns hash of the tip of the best-block-chain
@@ -701,15 +880,13 @@ func (b *EthereumRPC) processCallTrace(call *rpcCallTrace, d *bchain.EthereumInt
 	return contracts
 }
 
-// getInternalDataForBlock fetches debug trace using callTracer, extracts internal transfers and creations and destructions of contracts
-func (b *EthereumRPC) getInternalDataForBlock(blockHash string, blockHeight uint32, transactions []bchain.RpcTransaction) ([]bchain.EthereumInternalData, []bchain.ContractInfo, error) {
+// getInternalDataForBlock fetches debug trace using callTracer, extracts internal transfers/creations/destructions; ctx controls cancellation.
+func (b *EthereumRPC) getInternalDataForBlock(ctx context.Context, blockHash string, blockHeight uint32, transactions []bchain.RpcTransaction) ([]bchain.EthereumInternalData, []bchain.ContractInfo, error) {
 	data := make([]bchain.EthereumInternalData, len(transactions))
 	contracts := make([]bchain.ContractInfo, 0)
 	if ProcessInternalTransactions {
-		ctx, cancel := context.WithTimeout(context.Background(), b.Timeout)
-		defer cancel()
 		var trace []rpcTraceResult
-		err := b.RPC.CallContext(ctx, &trace, "debug_traceBlockByHash", blockHash, map[string]interface{}{"tracer": "callTracer"})
+		err := b.RPC.CallContext(ctx, &trace, "debug_traceBlockByHash", blockHash, map[string]interface{}{"tracer": "callTracer"}) // Use caller-provided ctx for timeout/cancel.
 		if err != nil {
 			glog.Error("debug_traceBlockByHash block ", blockHash, ", error ", err)
 			return data, contracts, err
@@ -783,33 +960,62 @@ func (b *EthereumRPC) GetBlock(hash string, height uint32) (*bchain.Block, error
 	if err != nil {
 		return nil, err
 	}
-	var head rpcHeader
-	if err := json.Unmarshal(raw, &head); err != nil {
+	var block struct {
+		rpcHeader            // Embed to unmarshal header and txs in one pass.
+		rpcBlockTransactions // Embed to avoid a second JSON decode.
+	}
+	if err := json.Unmarshal(raw, &block); err != nil { // Single decode to reduce CPU overhead.
 		return nil, errors.Annotatef(err, "hash %v, height %v", hash, height)
 	}
-	var body rpcBlockTransactions
-	if err := json.Unmarshal(raw, &body); err != nil {
-		return nil, errors.Annotatef(err, "hash %v, height %v", hash, height)
-	}
+	head := block.rpcHeader
+	body := block.rpcBlockTransactions
 	bbh, err := b.ethHeaderToBlockHeader(&head)
 	if err != nil {
 		return nil, errors.Annotatef(err, "hash %v, height %v", hash, height)
 	}
-	// get block events
-	// TODO - could be possibly done in parallel to getInternalDataForBlock
-	logs, ens, err := b.processEventsForBlock(head.Number)
-	if err != nil {
-		return nil, err
+	// Run event/log processing and internal data extraction in parallel; allow early return on log failure.
+	ctxInternal, cancelInternal := context.WithTimeout(context.Background(), b.Timeout) // Cancel trace RPC on log error or timeout.
+	defer cancelInternal()                                                              // Ensure timer resources are released on any return path.
+	type logsResult struct {                                                            // Bundles processEventsForBlock outputs for channel return.
+		logs map[string][]*bchain.RpcLog
+		ens  []bchain.AddressAliasRecord
+		err  error
 	}
+	type internalResult struct { // Bundles getInternalDataForBlock outputs for channel return.
+		data      []bchain.EthereumInternalData
+		contracts []bchain.ContractInfo
+		err       error
+	}
+	logsCh := make(chan logsResult, 1)         // Buffered so send won't block if we return early.
+	internalCh := make(chan internalResult, 1) // Buffered to avoid goroutine leak on early return.
+	go func() {
+		logs, ens, err := b.processEventsForBlock(head.Number)
+		logsCh <- logsResult{logs: logs, ens: ens, err: err} // Send result without shared state.
+	}()
+	go func() {
+		data, contracts, err := b.getInternalDataForBlock(ctxInternal, head.Hash, bbh.Height, body.Transactions) // ctxInternal allows cancellation on log errors.
+		internalCh <- internalResult{data: data, contracts: contracts, err: err}                                 // Send result without shared state.
+	}()
+	logsRes := <-logsCh
+	if logsRes.err != nil {
+		// Short-circuit on log failure to preserve existing error behavior.
+		return nil, logsRes.err
+	}
+	internalRes := <-internalCh
+	// Rebind results to keep downstream logic unchanged.
+	logs := logsRes.logs
+	ens := logsRes.ens
+	internalData := internalRes.data
+	contracts := internalRes.contracts
+	internalErr := internalRes.err
 	// error fetching internal data does not stop the block processing
 	var blockSpecificData *bchain.EthereumBlockSpecificData
-	internalData, contracts, err := b.getInternalDataForBlock(head.Hash, bbh.Height, body.Transactions)
 	// pass internalData error and ENS records in blockSpecificData to be stored
-	if err != nil || len(ens) > 0 || len(contracts) > 0 {
+	if internalErr != nil || len(ens) > 0 || len(contracts) > 0 {
 		blockSpecificData = &bchain.EthereumBlockSpecificData{}
-		if err != nil {
-			blockSpecificData.InternalDataError = err.Error()
-			// glog.Info("InternalDataError ", bbh.Height, ": ", err.Error())
+		if internalErr != nil {
+			blockSpecificData.InternalDataError = internalErr.Error()
+			// glog.Info("InternalDataError ", bbh.Height, ": ", internalErr.Error())
 		}
 		if len(ens) > 0 {
 			blockSpecificData.AddressAliasRecords = ens
@@ -1035,6 +1241,17 @@ func (b *EthereumRPC) EthereumTypeEstimateGas(params map[string]interface{}) (ui
 	if s, ok := GetStringFromMap("gasPrice", params); ok && len(s) > 0 {
 		msg.GasPrice, _ = hexutil.DecodeBig(s)
 	}
+
+	if b.alternativeSendTxProvider != nil {
+		result, err := b.alternativeSendTxProvider.callHttpStringResult(
+			b.alternativeSendTxProvider.urls[0],
+			"eth_estimateGas",
+			params,
+		)
+		if err == nil {
+			return hexutil.DecodeUint64(result)
+		}
+	}
 	return b.Client.EstimateGas(ctx, msg)
 }
 
@@ -1116,12 +1333,15 @@ func (b *EthereumRPC) EthereumTypeGetEip1559Fees() (*bchain.Eip1559Fees, error) 
 }
 
 // SendRawTransaction sends raw transaction
-func (b *EthereumRPC) SendRawTransaction(hex string) (string, error) {
+func (b *EthereumRPC) SendRawTransaction(hex string, disableAlternativeRPC bool) (string, error) {
 	var txid string
 	var retErr error
 
-	if b.alternativeSendTxProvider != nil {
+	if !disableAlternativeRPC && b.alternativeSendTxProvider != nil {
 		txid, retErr = b.alternativeSendTxProvider.SendRawTransaction(hex)
+		if retErr == nil {
+			return txid, nil
+		}
 		if b.alternativeSendTxProvider.UseOnlyAlternativeProvider() {
 			return txid, retErr
 		}
@@ -1170,9 +1390,41 @@ func (b *EthereumRPC) EthereumTypeGetBalance(addrDesc bchain.AddressDescriptor) 
 
 // EthereumTypeGetNonce returns current balance of an address
 func (b *EthereumRPC) EthereumTypeGetNonce(addrDesc bchain.AddressDescriptor) (uint64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), b.Timeout)
-	defer cancel()
-	return b.Client.NonceAt(ctx, addrDesc, nil)
+	var result string
+	var err error
+	var usedAlternative bool
+
+	ethAddress := ethcommon.BytesToAddress(addrDesc)
+
+	if b.alternativeSendTxProvider != nil {
+		result, err = b.alternativeSendTxProvider.callHttpStringResult(
+			b.alternativeSendTxProvider.urls[0],
+			"eth_getTransactionCount",
+			ethAddress,
+			"pending",
+		)
+		if err == nil && result != "" {
+			usedAlternative = true
+		} else {
+			glog.Errorf("Alternative provider failed for eth_getTransactionCount: %v, falling back to primary RPC", err)
+		}
+	}
+
+	if !usedAlternative {
+		result, err = b.callRpcStringResult("eth_getTransactionCount", ethAddress, "pending")
+		if err != nil {
+			glog.Errorf("Primary RPC failed for eth_getTransactionCount: %v", err)
+			return 0, err
+		}
+	}
+
+	nonce, err := hexutil.DecodeUint64(result)
+	if err != nil {
+		glog.Errorf("Failed to parse nonce result '%s': %v", result, err)
+		return 0, err
+	}
+
+	return nonce, nil
 }
 
 // GetChainParser returns ethereum BlockChainParser

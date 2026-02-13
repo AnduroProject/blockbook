@@ -38,7 +38,7 @@ func NewPolygonRPC(config json.RawMessage, pushHandler func(bchain.NotificationT
 func (b *PolygonRPC) Initialize() error {
 	b.OpenRPC = eth.OpenRPC
 
-	rc, ec, err := b.OpenRPC(b.ChainConfig.RPCURL)
+	rc, ec, err := b.OpenRPC(b.ChainConfig.RPCURL, b.ChainConfig.RPCURLWS)
 	if err != nil {
 		return err
 	}
@@ -66,6 +66,8 @@ func (b *PolygonRPC) Initialize() error {
 	default:
 		return errors.Errorf("Unknown network id %v", id)
 	}
+
+	b.InitAlternativeProviders()
 
 	glog.Info("rpc: block chain ", b.Network)
 

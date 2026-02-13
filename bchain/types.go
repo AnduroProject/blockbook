@@ -299,6 +299,11 @@ type OnNewTxFunc func(tx *MempoolTx)
 // AddrDescForOutpointFunc returns address descriptor and value for given outpoint or nil if outpoint not found
 type AddrDescForOutpointFunc func(outpoint Outpoint) (AddressDescriptor, *big.Int)
 
+// MempoolBatcher allows batch fetching of mempool transactions when supported.
+type MempoolBatcher interface {
+	GetRawTransactionsForMempoolBatch(txids []string) (map[string]*Tx, error)
+}
+
 // BlockChain defines common interface to block chain daemon
 type BlockChain interface {
 	// life-cycle methods
@@ -331,7 +336,7 @@ type BlockChain interface {
 	EstimateSmartFee(blocks int, conservative bool) (big.Int, error)
 	EstimateFee(blocks int) (big.Int, error)
 	LongTermFeeRate() (*LongTermFeeRate, error)
-	SendRawTransaction(tx string) (string, error)
+	SendRawTransaction(tx string, disableAlternativeRPC bool) (string, error)
 	GetMempoolEntry(txid string) (*MempoolEntry, error)
 	GetContractInfo(contractDesc AddressDescriptor) (*ContractInfo, error)
 	// parser
@@ -342,6 +347,7 @@ type BlockChain interface {
 	EthereumTypeEstimateGas(params map[string]interface{}) (uint64, error)
 	EthereumTypeGetEip1559Fees() (*Eip1559Fees, error)
 	EthereumTypeGetErc20ContractBalance(addrDesc, contractDesc AddressDescriptor) (*big.Int, error)
+	EthereumTypeGetErc20ContractBalances(addrDesc AddressDescriptor, contractDescs []AddressDescriptor) ([]*big.Int, error)
 	EthereumTypeGetSupportedStakingPools() []string
 	EthereumTypeGetStakingPoolsData(addrDesc AddressDescriptor) ([]StakingPoolData, error)
 	EthereumTypeRpcCall(data, to, from string) (string, error)
