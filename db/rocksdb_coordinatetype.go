@@ -6,7 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"math/big"
-
+    "github.com/bsm/go-vlq"
 	"github.com/linxGnu/grocksdb"
 	"github.com/trezor/blockbook/bchain"
 )
@@ -874,16 +874,19 @@ func (d *RocksDB) lookupSpentController(
 // packAssetTxEntry creates cfAddresses-compatible value for one tx.
 func (d *RocksDB) packAssetTxEntry(btxID []byte, indexes []int32) []byte {
 	buf := make([]byte, 0, len(btxID)+len(indexes)*2)
+	bvout := make([]byte, vlq.MaxLen32)
 	buf = append(buf, btxID...)
 	for i, idx := range indexes {
 		v := idx << 1
 		if i == len(indexes)-1 {
-			v |= 1 // last index marker
+			v |= 1
 		}
-		buf = appendVarint32(buf, v)
+		l := packVarint32(v, bvout)
+		buf = append(buf, bvout[:l]...)
 	}
 	return buf
 }
+
 
 func appendVarint32(buf []byte, v int32) []byte {
 	uv := uint32(v)
