@@ -396,6 +396,19 @@ type Address struct {
 	XPubAddresses map[string]struct{} `json:"-" ts_doc:"Set of derived XPUB addresses (internal usage)."`
 }
 
+type AssetInfo struct {
+	Paging
+	Controller   string   `json:"controller"`
+	Ticker       string   `json:"ticker,omitempty"`
+	Headline     string   `json:"headline,omitempty"`
+	Precision    int      `json:"precision"`
+	AssetType    int      `json:"assetType"`
+	TotalSupply  *Amount  `json:"totalSupply,omitempty"`
+	Txs          int      `json:"txs"`
+	Transactions []*Tx    `json:"transactions,omitempty"`
+	Txids        []string `json:"txids,omitempty"`
+}
+
 // Utxo is one unspent transaction output
 type Utxo struct {
 	Txid          string  `json:"txid" ts_doc:"Transaction ID in which this UTXO was created."`
@@ -407,6 +420,8 @@ type Utxo struct {
 	Path          string  `json:"path,omitempty" ts_doc:"Derivation path for XPUB-based wallets, if applicable."`
 	Locktime      uint32  `json:"lockTime,omitempty" ts_doc:"If non-zero, locktime required before spending this UTXO."`
 	Coinbase      bool    `json:"coinbase,omitempty" ts_doc:"Indicates if this UTXO originated from a coinbase transaction."`
+	Controller    string  `json:"controller,omitempty"`
+	IsController  bool    `json:"isController,omitempty"`
 }
 
 // Utxos is array of Utxo

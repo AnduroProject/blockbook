@@ -48,6 +48,11 @@ type connectBlockStats struct {
 // AddressBalanceDetail specifies what data are returned by GetAddressBalance
 type AddressBalanceDetail int
 
+// AssetSupporter is implemented by chain parsers that track UTXO-based assets.
+type AssetSupporter interface {
+	SupportsAssets() bool
+}
+
 const (
 	// AddressBalanceDetailNoUTXO returns address balance without utxos
 	AddressBalanceDetailNoUTXO = 0
@@ -76,6 +81,7 @@ type RocksDB struct {
 	connectBlockMux       sync.Mutex
 	addrContractsCacheMux sync.Mutex
 	addrContractsCache    map[string]*unpackedAddrContracts
+	assetAware            bool
 	// addrContractsCacheMinSize is the packed size threshold (bytes) before we cache an entry.
 	addrContractsCacheMinSize int
 	// addrContractsCacheMaxBytes is a soft cap; when exceeded we flush and clear the cache.
@@ -138,6 +144,8 @@ func openDB(path string, c *grocksdb.Cache, openFiles int) (*grocksdb.DB, []*gro
 	return db, cfh, nil
 }
 
+
+
 // NewRocksDB opens an internal handle to RocksDB environment.  Close
 // needs to be called to release it.
 func NewRocksDB(path string, cacheSize, maxOpenFiles int, parser bchain.BlockChainParser, metrics *common.Metrics, extendedIndex bool) (d *RocksDB, err error) {
@@ -177,11 +185,18 @@ func NewRocksDB(path string, cacheSize, maxOpenFiles int, parser bchain.BlockCha
 		connectBlockMux:            sync.Mutex{},
 		addrContractsCacheMux:      sync.Mutex{},
 		addrContractsCache:         make(map[string]*unpackedAddrContracts),
+		assetAware:                 false,
 		addrContractsCacheMinSize:  addrContractsCacheMinSize,
 		addrContractsCacheMaxBytes: 0,
 		addrContractsCacheBytes:    0,
 		hotAddrTracker:             nil,
 	}
+
+	if as, ok := parser.(AssetSupporter); ok && as.SupportsAssets() {
+		r.assetAware = true
+		glog.Info("rocksdb: asset-aware UTXO storage enabled")
+	}
+
 	if chainType == bchain.ChainEthereumType {
 		r.hotAddrTracker = newAddressHotnessFromParser(parser)
 		if cfg, ok := parser.(addressContractsCacheConfigProvider); ok {
@@ -418,6 +433,12 @@ func (d *RocksDB) ConnectBlock(block *bchain.Block) error {
 		if err := d.processAddressesBitcoinType(block, addresses, txAddressesMap, balances, gf); err != nil {
 			return err
 		}
+		if d.assetAware {
+			if err := d.processAssetsCoordinateType(block, wb, txAddressesMap, balances); err != nil {
+				return err
+			}
+		}
+		
 		if d.metrics != nil {
 			tipTxs = uint64(len(block.Txs))
 			for i := range block.Txs {
@@ -563,6 +584,8 @@ type Utxo struct {
 	Vout     int32
 	Height   uint32
 	ValueSat big.Int
+	Controller []byte // packed controller outpoint; nil for non-asset UTXO
+	IsController bool // true if this UTXO IS the controller output
 }
 
 // AddrBalance stores number of transactions and balances of an address
@@ -935,7 +958,7 @@ func (d *RocksDB) storeBalances(wb *grocksdb.WriteBatch, abm map[string]*AddrBal
 		if ab == nil || ab.Txs <= 0 {
 			wb.DeleteCF(d.cfh[cfAddressBalance], bchain.AddressDescriptor(addrDesc))
 		} else {
-			buf = packAddrBalance(ab, buf, varBuf)
+			buf = packAddrBalance(ab, buf, varBuf, d.assetAware)
 			wb.PutCF(d.cfh[cfAddressBalance], bchain.AddressDescriptor(addrDesc), buf)
 		}
 	}
@@ -1041,7 +1064,7 @@ func (d *RocksDB) GetAddrDescBalance(addrDesc bchain.AddressDescriptor, detail A
 	if len(buf) < 3 {
 		return nil, nil
 	}
-	return unpackAddrBalance(buf, d.chainParser.PackedTxidLen(), detail)
+	return unpackAddrBalance(buf, d.chainParser.PackedTxidLen(), detail, d.assetAware)
 }
 
 // GetAddressBalance returns address balance for an address or nil if address not found
@@ -1178,7 +1201,7 @@ func (d *RocksDB) appendTxOutput(txo *TxOutput, buf []byte, varBuf []byte) []byt
 	return buf
 }
 
-func unpackAddrBalance(buf []byte, txidUnpackedLen int, detail AddressBalanceDetail) (*AddrBalance, error) {
+func unpackAddrBalance(buf []byte, txidUnpackedLen int, detail AddressBalanceDetail, assetAware bool) (*AddrBalance, error) {
 	txs, l := unpackVaruint(buf)
 	sentSat, sl := unpackBigint(buf[l:])
 	balanceSat, bl := unpackBigint(buf[l+sl:])
@@ -1207,6 +1230,20 @@ func unpackAddrBalance(buf []byte, txidUnpackedLen int, detail AddressBalanceDet
 				Height:   uint32(height),
 				ValueSat: valueSat,
 			}
+
+			if assetAware {
+				ctrlLen, cl := unpackVaruint(buf[l:])
+				l += cl
+				if ctrlLen > 0 {
+					u.Controller = append([]byte(nil), buf[l:l+int(ctrlLen)]...)
+					l += int(ctrlLen)
+					if buf[l] == 1 {
+						u.IsController = true
+					}
+					l++
+				}
+			}
+
 			if detail == AddressBalanceDetailUTXO {
 				ab.Utxos = append(ab.Utxos, u)
 			} else {
@@ -1217,7 +1254,7 @@ func unpackAddrBalance(buf []byte, txidUnpackedLen int, detail AddressBalanceDet
 	return ab, nil
 }
 
-func packAddrBalance(ab *AddrBalance, buf, varBuf []byte) []byte {
+func packAddrBalance(ab *AddrBalance, buf, varBuf []byte, assetAware bool) []byte {
 	buf = buf[:0]
 	l := packVaruint(uint(ab.Txs), varBuf)
 	buf = append(buf, varBuf[:l]...)
@@ -1235,6 +1272,18 @@ func packAddrBalance(ab *AddrBalance, buf, varBuf []byte) []byte {
 			buf = append(buf, varBuf[:l]...)
 			l = packBigint(&utxo.ValueSat, varBuf)
 			buf = append(buf, varBuf[:l]...)
+			if assetAware {
+				l = packVaruint(uint(len(utxo.Controller)), varBuf)
+				buf = append(buf, varBuf[:l]...)
+				if len(utxo.Controller) > 0 {
+					buf = append(buf, utxo.Controller...)
+					if utxo.IsController {
+						buf = append(buf, 1)
+					} else {
+						buf = append(buf, 0)
+					}
+				}
+			}
 		}
 	}
 	return buf
@@ -2411,7 +2460,7 @@ func (d *RocksDB) FixUtxos(stop chan os.Signal) error {
 				errorsCount++
 				continue
 			}
-			ba, err := unpackAddrBalance(buf, d.chainParser.PackedTxidLen(), AddressBalanceDetailUTXO)
+			ba, err := unpackAddrBalance(buf, d.chainParser.PackedTxidLen(), AddressBalanceDetailUTXO, d.assetAware)
 			if err != nil {
 				glog.Error("FixUtxos: row ", row, ", addrDesc ", addrDesc, ", unpackAddrBalance error ", err)
 				errorsCount++

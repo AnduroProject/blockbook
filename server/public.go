@@ -212,6 +212,7 @@ func (s *PublicServer) ConnectFullPublicInterface() {
 	serveMux.HandleFunc(path+"api/v2/feestats/", s.jsonHandler(s.apiFeeStats, apiV2))
 	serveMux.HandleFunc(path+"api/v2/balancehistory/", s.jsonHandler(s.apiBalanceHistory, apiDefault))
 	serveMux.HandleFunc(path+"api/v2/tickers/", s.jsonHandler(s.apiTickers, apiV2))
+	serveMux.HandleFunc(path+"api/v2/asset/", s.jsonHandler(s.apiAsset, apiV2))
 	serveMux.HandleFunc(path+"api/v2/multi-tickers/", s.jsonHandler(s.apiMultiTickers, apiV2))
 	serveMux.HandleFunc(path+"api/v2/tickers-list/", s.jsonHandler(s.apiAvailableVsCurrencies, apiV2))
 	// socket.io interface
@@ -220,6 +221,40 @@ func (s *PublicServer) ConnectFullPublicInterface() {
 	serveMux.Handle(path+"websocket", s.websocket.GetHandler())
 	s.isFullInterface = true
 }
+
+
+func (s *PublicServer) apiAsset(r *http.Request, apiVersion int) (interface{}, error) {
+    var controller string
+    if i := strings.LastIndex(r.URL.Path, "asset/"); i > 0 {
+        controller = r.URL.Path[i+6:]
+    }
+    if len(controller) == 0 {
+        return nil, api.NewAPIError("Missing controller", true)
+    }
+    s.metrics.ExplorerViews.With(common.Labels{"action": "api-asset"}).Inc()
+
+    page, ec := strconv.Atoi(r.URL.Query().Get("page"))
+    if ec != nil {
+        page = 0
+    }
+    pageSize, ec := strconv.Atoi(r.URL.Query().Get("pageSize"))
+    if ec != nil || pageSize > txsInAPI {
+        pageSize = txsInAPI
+    }
+
+    option := api.AccountDetailsTxidHistory
+    switch r.URL.Query().Get("details") {
+    case "basic":
+        option = api.AccountDetailsBasic
+    case "txids":
+        option = api.AccountDetailsTxidHistory
+    case "txs":
+        option = api.AccountDetailsTxHistory
+    }
+
+    return s.api.GetAsset(controller, page, pageSize, option)
+}
+
 
 // Close closes the server
 func (s *PublicServer) Close() error {

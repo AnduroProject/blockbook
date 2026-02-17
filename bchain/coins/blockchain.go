@@ -59,6 +59,7 @@ import (
 	"github.com/trezor/blockbook/bchain/coins/vipstarcoin"
 	"github.com/trezor/blockbook/bchain/coins/zec"
 	"github.com/trezor/blockbook/common"
+	"github.com/trezor/blockbook/bchain/coins/coordinate"
 )
 
 type blockChainFactory func(config json.RawMessage, pushHandler func(bchain.NotificationType)) (bchain.BlockChain, error)
@@ -152,6 +153,8 @@ func init() {
 	BlockChainFactories["Arbitrum Nova Archive"] = arbitrum.NewArbitrumRPC
 	BlockChainFactories["Base"] = base.NewBaseRPC
 	BlockChainFactories["Base Archive"] = base.NewBaseRPC
+    BlockChainFactories["Coordinate Testnet4"] = coordinate.NewCoordinateRPC
+    BlockChainFactories["Coordinate Regtest"] = coordinate.NewCoordinateRPC
 }
 
 type metricsSetter interface {

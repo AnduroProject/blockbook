@@ -1,0 +1,18 @@
+{
+  "coin_name": "Coordinate Testnet4",
+  "coin_shortcut": "CBTC",
+  "coin_label": "Coordinate Testnet4",
+  "rpc_url": "http://127.0.0.1:18332",
+  "rpc_user": "marachain",
+  "rpc_pass": "marachain",
+  "rpc_timeout": 25,
+  "parse": true,
+  "message_queue_binding": "tcp://127.0.0.1:37000",
+  "subversion": "",
+  "address_format": "",
+  "xpub_magic": 70617039,
+  "slip44": 2121,
+  "mempool_workers": 8,
+  "mempool_sub_workers": 2,
+  "block_addresses_to_keep": 300
+}

@@ -58,6 +58,7 @@ type Vin struct {
 	Sequence  uint32    `json:"sequence" ts_doc:"Sequence number for the input."`
 	Addresses []string  `json:"addresses" ts_doc:"Addresses derived from this input's script (if known)."`
 	Witness   [][]byte  `json:"-" ts_doc:"Witness data for SegWit inputs (not exposed via JSON)."`
+	AssetId   string    `json:"-" ts_doc:"Coordinate: asset ID hex from vin`
 }
 
 // ScriptPubKey contains data about output script
@@ -136,6 +137,7 @@ const (
 
 	// XPUBAddressStandard is address derived from xpub
 	XPUBAddressStandard TokenStandardName = "XPUBAddress"
+	CoordinateAssetStandard TokenStandardName = "CoordinateAsset"
 )
 
 // TokenTransfers is array of TokenTransfer

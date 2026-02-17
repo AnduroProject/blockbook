@@ -1410,6 +1410,19 @@ func (w *Worker) GetAddress(address string, page int, txsOnPage int, option Acco
 				totalResults = -1
 			}
 		}
+
+		if w.db.IsAssetAware() {
+			assetTokens, assetTotalResults, err := w.getCoordinateAssetData(addrDesc, option, filter)
+			if err != nil {
+				return nil, err
+			}
+			if assetTokens != nil {
+				ed.tokens = assetTokens
+			}
+			if assetTotalResults >= 0 {
+				totalResults = assetTotalResults
+			}
+		}
 	}
 	// if there are only unconfirmed transactions, there is no paging
 	if ba == nil {
@@ -1453,7 +1466,13 @@ func (w *Worker) GetAddress(address string, page int, txsOnPage int, option Acco
 	}
 	// get tx history if requested by option or check mempool if there are some transactions for a new address
 	if option >= AccountDetailsTxidHistory && filter.Vout != AddressFilterVoutQueryNotNecessary {
-		txc, err := w.getAddressTxids(addrDesc, false, filter, (page+1)*txsOnPage)
+		var txc []string
+		if w.db.IsAssetAware() && filter.Contract != "" {
+			// Per-asset tx history uses the ax: index
+			txc, err = w.getAssetFilteredTxids(addrDesc, filter, (page+1)*txsOnPage)
+		} else {
+			txc, err = w.getAddressTxids(addrDesc, false, filter, (page+1)*txsOnPage)
+		}
 		if err != nil {
 			return nil, errors.Annotatef(err, "getAddressTxids %v false", addrDesc)
 		}
@@ -1531,6 +1550,15 @@ func (w *Worker) GetAddress(address string, page int, txsOnPage int, option Acco
 		AddressAliases:        w.getAddressAliases(addresses),
 		StakingPools:          ed.stakingPools,
 	}
+
+	// Asset tokens for Coordinate chains
+	if w.db.IsAssetAware() && len(r.Tokens) == 0 {
+		assetTokens, _, err := w.getCoordinateAssetData(addrDesc, option, filter)
+		if err == nil && len(assetTokens) > 0 {
+			r.Tokens = assetTokens
+		}
+	}
+	
 	// keep address backward compatible, set deprecated Erc20Contract value if ERC20 token
 	if ed.contractInfo != nil && ed.contractInfo.Standard == bchain.ERC20TokenStandard {
 		r.Erc20Contract = ed.contractInfo
@@ -1901,14 +1929,19 @@ func (w *Worker) getAddrDescUtxo(addrDesc bchain.AddressDescriptor, ba *db.AddrB
 					}
 					_, e = inMempool[txid]
 					if !e {
-						utxos = append(utxos, Utxo{
+						u := Utxo{
 							Txid:          txid,
 							Vout:          utxo.Vout,
 							AmountSat:     (*Amount)(&utxo.ValueSat),
 							Height:        int(utxo.Height),
 							Confirmations: confirmations,
 							Coinbase:      coinbase,
-						})
+						}
+						if len(utxo.Controller) > 0 {
+							u.Controller = w.db.FormatControllerOutpoint(utxo.Controller)
+							u.IsController = utxo.IsController
+						}
+						utxos = append(utxos, u)
 					}
 				}
 				checksum.Sub(&checksum, &utxo.ValueSat)
@@ -2633,4 +2666,191 @@ func (w *Worker) EstimateFee(blocks int, conservative bool) (big.Int, error) {
 		return w.chain.EstimateSmartFee(blocks, conservative)
 	}
 	return w.cachedEstimateFee(blocks, conservative)
+}
+
+// getCoordinateAssetData builds the token list and adjusts totalResults
+// when filtering by a specific asset (via ?contract=txid:0).
+//
+// Works with both address string and address descriptor input since
+// addrDesc is already resolved by the caller.
+func (w *Worker) getCoordinateAssetData(
+    addrDesc bchain.AddressDescriptor,
+    option AccountDetails,
+    filter *AddressFilter,
+) (Tokens, int, error) {
+    if option < AccountDetailsTokens {
+        return nil, -1, nil
+    }
+
+    assets, err := w.db.GetAddrDescAssets(addrDesc)
+    if err != nil {
+        return nil, -1, err
+    }
+    if len(assets) == 0 {
+        return nil, -1, nil
+    }
+
+    // If filtering by specific asset
+    var filterCtrl []byte
+    if filter.Contract != "" {
+        filterCtrl, err = w.db.ParseControllerString(filter.Contract)
+        if err != nil {
+            return nil, -1, NewAPIError(fmt.Sprintf("Invalid contract filter: %v", err), true)
+        }
+    }
+
+    tokens := make(Tokens, 0, len(assets))
+    totalResults := -1
+
+    for _, a := range assets {
+        ctrlStr := w.db.FormatControllerOutpoint(a.Controller)
+
+        // If filtering, skip non-matching assets
+        if filterCtrl != nil && !bytes.Equal(filterCtrl, a.Controller) {
+            continue
+        }
+
+        t := Token{
+            Standard:   bchain.CoordinateAssetStandard,
+            Type:       bchain.CoordinateAssetStandard,
+            Contract:   ctrlStr,
+            Transfers:  int(a.Balance.Txs),
+            BalanceSat: (*Amount)(&a.Balance.BalanceSat),
+        }
+
+        // Fetch asset metadata from registry
+        entry, err := w.db.GetAssetRegistryEntry(a.Controller)
+        if err == nil && entry != nil && !entry.IsRedirect {
+            t.Name = entry.Headline
+            t.Symbol = entry.Ticker
+            t.Decimals = int(entry.Precision)
+        }
+
+        tokens = append(tokens, t)
+
+        // If filtering by this specific asset, use its tx count for paging
+        if filterCtrl != nil && bytes.Equal(filterCtrl, a.Controller) {
+            if filter.FromHeight == 0 && filter.ToHeight == 0 {
+                totalResults = int(a.Balance.Txs)
+            }
+        }
+    }
+
+    return tokens, totalResults, nil
+}
+
+// getAssetFilteredTxids returns txids for one address + one asset.
+// Uses the ax: (per-address per-asset) index in the DB.
+//
+// Works with any addrDesc (from address string or raw descriptor).
+func (w *Worker) getAssetFilteredTxids(
+    addrDesc bchain.AddressDescriptor,
+    filter *AddressFilter,
+    maxResults int,
+) ([]string, error) {
+    ctrl, err := w.db.ParseControllerString(filter.Contract)
+    if err != nil || ctrl == nil {
+        return nil, NewAPIError(fmt.Sprintf("Invalid contract: %v", err), true)
+    }
+
+    to := filter.ToHeight
+    if to == 0 {
+        to = maxUint32
+    }
+
+    txids := make([]string, 0, 32)
+    err = w.db.GetAddrDescAssetTransactions(addrDesc, ctrl, filter.FromHeight, to,
+        func(txid string, height uint32, indexes []int32) error {
+            txids = append(txids, txid)
+            if len(txids) >= maxResults {
+                return &db.StopIteration{}
+            }
+            return nil
+        })
+    if err != nil {
+        return nil, err
+    }
+    return txids, nil
+}
+
+// GetAsset returns global info and tx history for an asset.
+// The controller parameter can be either "txid:0" string or raw hex.
+//
+// This endpoint is registered as /api/v2/asset/{controller}
+func (w *Worker) GetAsset(controller string, page, txsOnPage int, option AccountDetails) (*AssetInfo, error) {
+    page--
+    if page < 0 {
+        page = 0
+    }
+
+    ctrl, err := w.db.ParseControllerString(controller)
+    if err != nil || ctrl == nil {
+        return nil, NewAPIError(fmt.Sprintf("Invalid controller: %v", err), true)
+    }
+
+    // Resolve to current controller
+    resolved := w.db.ResolveCurrentController(ctrl)
+
+    // Get registry entry
+    entry, err := w.db.GetAssetRegistryEntry(resolved)
+    if err != nil {
+        return nil, err
+    }
+
+    r := &AssetInfo{
+        Controller: w.db.FormatControllerOutpoint(resolved),
+    }
+
+    if entry != nil && !entry.IsRedirect {
+        r.Ticker = entry.Ticker
+        r.Headline = entry.Headline
+        r.Precision = int(entry.Precision)
+        r.AssetType = int(entry.AssetType)
+        r.TotalSupply = (*Amount)(&entry.TotalSupply)
+    }
+
+    // Get tx history
+    if option >= AccountDetailsTxidHistory {
+        txids := make([]string, 0, 32)
+        err = w.db.GetAssetTransactions(resolved, 0, maxUint32,
+            func(txid string, height uint32, indexes []int32) error {
+                txids = append(txids, txid)
+                return nil
+            })
+        if err != nil {
+            return nil, err
+        }
+
+        r.Txs = len(txids)
+
+        // Paginate
+        pg, from, to, page := computePaging(len(txids), page, txsOnPage)
+        r.Paging = pg
+
+        if option == AccountDetailsTxidHistory {
+            if from < len(txids) {
+                end := to
+                if end > len(txids) {
+                    end = len(txids)
+                }
+                r.Txids = txids[from:end]
+            }
+        } else if option >= AccountDetailsTxHistoryLight {
+            bestheight, _, err := w.db.GetBestBlock()
+            if err != nil {
+                return nil, err
+            }
+            addresses := w.newAddressesMapForAliases()
+            for i := from; i < to && i < len(txids); i++ {
+                tx, err := w.txFromTxid(txids[i], bestheight, option, nil, addresses)
+                if err != nil {
+                    return nil, err
+                }
+                r.Transactions = append(r.Transactions, tx)
+            }
+        }
+        _ = page // suppress unused
+    }
+
+    return r, nil
 }
