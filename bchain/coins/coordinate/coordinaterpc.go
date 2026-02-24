@@ -63,7 +63,7 @@ type ResGetCoordinateBlock struct {
 
 type CoordinateBlockResult struct {
 	bchain.BlockHeader
-	Txids         []string                `json:"tx"`
+	Txs           []json.RawMessage       `json:"tx"`
 	PreconfBlocks []CoordinateSignedBlock `json:"preconfblocks"`
 	Pegins        []json.RawMessage       `json:"pegins"`
 }
@@ -157,6 +157,8 @@ func (b *CoordinateRPC) GetChainInfo() (*bchain.ChainInfo, error) {
 
 // GetBlock returns block with transactions from all three sources:
 // vtx (mined), preconfblocks (signed blocks), pegins (Bitcoin mainchain).
+// Uses verbosity=2 so full transaction JSON is returned inline,
+// avoiding separate getrawtransaction calls (which fail for the genesis coinbase).
 func (b *CoordinateRPC) GetBlock(hash string, height uint32) (*bchain.Block, error) {
 	var err error
 	if hash == "" {
@@ -165,11 +167,11 @@ func (b *CoordinateRPC) GetBlock(hash string, height uint32) (*bchain.Block, err
 			return nil, err
 		}
 	}
-	glog.V(1).Info("rpc: getblock (verbosity=1) ", hash)
+	glog.V(1).Info("rpc: getblock (verbosity=2) ", hash)
 	res := ResGetCoordinateBlock{}
 	req := btc.CmdGetBlock{Method: "getblock"}
 	req.Params.BlockHash = hash
-	req.Params.Verbosity = 1
+	req.Params.Verbosity = 2
 	err = b.Call(&req, &res)
 	if err != nil {
 		return nil, errors.Annotatef(err, "hash %v", hash)
@@ -179,18 +181,20 @@ func (b *CoordinateRPC) GetBlock(hash string, height uint32) (*bchain.Block, err
 	}
 
 	// Estimate total tx count
-	totalTxs := len(res.Result.Txids) + len(res.Result.Pegins)
+	totalTxs := len(res.Result.Txs) + len(res.Result.Pegins)
 	for i := range res.Result.PreconfBlocks {
 		totalTxs += len(res.Result.PreconfBlocks[i].Txs)
 	}
 	txs := make([]bchain.Tx, 0, totalTxs)
 
-	// 1. Main mined transactions (vtx)
-	for _, txid := range res.Result.Txids {
-		tx, err := b.GetTransaction(txid)
+	// 1. Main mined transactions (vtx) — already full JSON from verbosity=2
+	for txIdx, rawTx := range res.Result.Txs {
+		tx, err := b.Parser.ParseTxFromJson(rawTx)
 		if err != nil {
-			return nil, err
+			glog.Warningf("rpc: failed to parse vtx %d in block %s: %v", txIdx, hash, err)
+			continue
 		}
+		tx.CoinSpecificData = rawTx
 		txs = append(txs, *tx)
 	}
 
