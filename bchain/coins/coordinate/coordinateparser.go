@@ -1,10 +1,12 @@
 package coordinate
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"math/big"
 
+	vlq "github.com/bsm/go-vlq"
 	"github.com/martinboehm/btcd/wire"
 	"github.com/martinboehm/btcutil/chaincfg"
 	"github.com/trezor/blockbook/bchain"
@@ -215,4 +217,126 @@ func (p *CoordinateParser) ParseTxFromJson(msg json.RawMessage) (*bchain.Tx, err
 	}
 
 	return &tx, nil
+}
+
+// ---------------------------------------------------------------------------
+// PackTx / UnpackTx — store JSON instead of wire-format bytes
+// ---------------------------------------------------------------------------
+
+// coordinatePackedVin is the minimal vin representation for DB storage.
+type coordinatePackedVin struct {
+	Coinbase  string           `json:"coinbase,omitempty"`
+	Txid      string           `json:"txid,omitempty"`
+	Vout      uint32           `json:"vout,omitempty"`
+	ScriptSig bchain.ScriptSig `json:"scriptSig,omitempty"`
+	Sequence  uint32           `json:"sequence,omitempty"`
+	Addresses []string         `json:"addresses,omitempty"`
+	AssetId   string           `json:"assetid,omitempty"`
+}
+
+// coordinatePackedVout stores value as a decimal string to avoid precision loss.
+type coordinatePackedVout struct {
+	ValueSat string   `json:"valueSat"`
+	N        uint32   `json:"n"`
+	Hex      string   `json:"hex,omitempty"`
+	Addrs    []string `json:"addrs,omitempty"`
+}
+
+// coordinatePackedTx is the compact JSON representation stored in RocksDB.
+type coordinatePackedTx struct {
+	Hex      string                 `json:"hex,omitempty"`
+	Txid     string                 `json:"txid"`
+	Version  int32                  `json:"version"`
+	LockTime uint32                 `json:"locktime,omitempty"`
+	VSize    int64                  `json:"vsize,omitempty"`
+	Vin      []coordinatePackedVin  `json:"vin"`
+	Vout     []coordinatePackedVout `json:"vout"`
+}
+
+// PackTx serialises a Coordinate transaction for DB storage.
+// Format: [4 bytes height][vlq blockTime][JSON of coordinatePackedTx]
+func (p *CoordinateParser) PackTx(tx *bchain.Tx, height uint32, blockTime int64) ([]byte, error) {
+	packed := coordinatePackedTx{
+		Hex:      tx.Hex,
+		Txid:     tx.Txid,
+		Version:  tx.Version,
+		LockTime: tx.LockTime,
+		VSize:    tx.VSize,
+		Vin:      make([]coordinatePackedVin, len(tx.Vin)),
+		Vout:     make([]coordinatePackedVout, len(tx.Vout)),
+	}
+	for i := range tx.Vin {
+		packed.Vin[i] = coordinatePackedVin{
+			Coinbase:  tx.Vin[i].Coinbase,
+			Txid:      tx.Vin[i].Txid,
+			Vout:      tx.Vin[i].Vout,
+			ScriptSig: tx.Vin[i].ScriptSig,
+			Sequence:  tx.Vin[i].Sequence,
+			Addresses: tx.Vin[i].Addresses,
+			AssetId:   tx.Vin[i].AssetId,
+		}
+	}
+	for i := range tx.Vout {
+		packed.Vout[i] = coordinatePackedVout{
+			ValueSat: tx.Vout[i].ValueSat.String(),
+			N:        tx.Vout[i].N,
+			Hex:      tx.Vout[i].ScriptPubKey.Hex,
+			Addrs:    tx.Vout[i].ScriptPubKey.Addresses,
+		}
+	}
+	jsonData, err := json.Marshal(packed)
+	if err != nil {
+		return nil, err
+	}
+	header := make([]byte, 4+vlq.MaxLen64)
+	binary.BigEndian.PutUint32(header[0:4], height)
+	vl := vlq.PutInt(header[4:], blockTime)
+	buf := make([]byte, 4+vl+len(jsonData))
+	copy(buf, header[:4+vl])
+	copy(buf[4+vl:], jsonData)
+	return buf, nil
+}
+
+// UnpackTx deserialises a Coordinate transaction from DB storage.
+func (p *CoordinateParser) UnpackTx(buf []byte) (*bchain.Tx, uint32, error) {
+	height := binary.BigEndian.Uint32(buf)
+	bt, l := vlq.Int(buf[4:])
+
+	var packed coordinatePackedTx
+	if err := json.Unmarshal(buf[4+l:], &packed); err != nil {
+		return nil, 0, err
+	}
+
+	tx := bchain.Tx{
+		Hex:       packed.Hex,
+		Txid:      packed.Txid,
+		Version:   packed.Version,
+		LockTime:  packed.LockTime,
+		VSize:     packed.VSize,
+		Blocktime: bt,
+		Vin:       make([]bchain.Vin, len(packed.Vin)),
+		Vout:      make([]bchain.Vout, len(packed.Vout)),
+	}
+	for i := range packed.Vin {
+		tx.Vin[i] = bchain.Vin{
+			Coinbase:  packed.Vin[i].Coinbase,
+			Txid:      packed.Vin[i].Txid,
+			Vout:      packed.Vin[i].Vout,
+			ScriptSig: packed.Vin[i].ScriptSig,
+			Sequence:  packed.Vin[i].Sequence,
+			Addresses: packed.Vin[i].Addresses,
+			AssetId:   packed.Vin[i].AssetId,
+		}
+	}
+	for i := range packed.Vout {
+		val := new(big.Int)
+		val.SetString(packed.Vout[i].ValueSat, 10)
+		tx.Vout[i] = bchain.Vout{
+			ValueSat: *val,
+			N:        packed.Vout[i].N,
+		}
+		tx.Vout[i].ScriptPubKey.Hex = packed.Vout[i].Hex
+		tx.Vout[i].ScriptPubKey.Addresses = packed.Vout[i].Addrs
+	}
+	return &tx, height, nil
 }

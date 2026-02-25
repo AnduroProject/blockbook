@@ -233,6 +233,23 @@ func (b *CoordinateRPC) GetTransactionForMempool(txid string) (*bchain.Tx, error
 	return b.GetTransaction(txid)
 }
 
+// GetRawTransactionsForMempoolBatch overrides the parent to use JSON (verbose)
+// fetching instead of raw hex, since Coordinate's wire format differs from Bitcoin.
+func (b *CoordinateRPC) GetRawTransactionsForMempoolBatch(txids []string) (map[string]*bchain.Tx, error) {
+	results := make(map[string]*bchain.Tx, len(txids))
+	for _, txid := range txids {
+		tx, err := b.GetTransaction(txid)
+		if err != nil {
+			if err == bchain.ErrTxNotFound {
+				continue
+			}
+			return nil, err
+		}
+		results[txid] = tx
+	}
+	return results, nil
+}
+
 func (b *CoordinateRPC) GetMempoolEntry(txid string) (*bchain.MempoolEntry, error) {
 	return nil, errors.New("GetMempoolEntry: not implemented")
 }
