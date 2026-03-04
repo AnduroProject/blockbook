@@ -184,6 +184,7 @@ type Token struct {
 	Transfers        int                      `json:"transfers" ts_doc:"Total number of token transfers for this address."`
 	Symbol           string                   `json:"symbol,omitempty" ts_doc:"Symbol for the token (e.g., 'ETH', 'USDT')."`
 	Decimals         int                      `json:"decimals,omitempty" ts_doc:"Number of decimals for this token."`
+	AssetType        int                      `json:"assetType,omitempty" ts_doc:"Asset type for Coordinate assets (0=not set)."`
 	BalanceSat       *Amount                  `json:"balance,omitempty" ts_doc:"Current token balance (in minimal base units)."`
 	BaseValue        float64                  `json:"baseValue,omitempty" ts_doc:"Value in the base currency (e.g. ETH for ERC20 tokens)."`
 	SecondaryValue   float64                  `json:"secondaryValue,omitempty" ts_doc:"Value in a secondary currency (e.g. fiat), if available."`
@@ -346,6 +347,8 @@ type AddressFilter struct {
 	TokensToReturn TokensToReturn `ts_doc:"Which tokens to include in the result set."`
 	// OnlyConfirmed set to true will ignore mempool transactions; mempool is also ignored if FromHeight/ToHeight filter is specified
 	OnlyConfirmed bool `ts_doc:"If true, ignores mempool (unconfirmed) transactions."`
+	// AssetType filters Coordinate asset tokens by their asset type. 0 means no filter, >0 filters by specific type.
+	AssetType int `ts_doc:"Filter Coordinate asset tokens by asset type (0 = no filter, >0 = specific type)."`
 }
 
 // StakingPool holds data about address participation in a staking pool contract
@@ -405,6 +408,7 @@ type AssetInfo struct {
 	AssetType    int      `json:"assetType"`
 	TotalSupply  *Amount  `json:"totalSupply,omitempty"`
 	Txs          int      `json:"txs"`
+	UnconfirmedTxs int    `json:"unconfirmedTxs,omitempty"`
 	Transactions []*Tx    `json:"transactions,omitempty"`
 	Txids        []string `json:"txids,omitempty"`
 }

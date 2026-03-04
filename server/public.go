@@ -901,12 +901,17 @@ func (s *PublicServer) getAddressQueryParams(r *http.Request, accountDetails api
 		gap = 0
 	}
 	contract := r.URL.Query().Get("contract")
+	assetType := 0
+	if at := r.URL.Query().Get("assettype"); at != "" {
+		assetType, _ = strconv.Atoi(at)
+	}
 	return page, pageSize, accountDetails, &api.AddressFilter{
 		Vout:           voutFilter,
 		TokensToReturn: tokensToReturn,
 		FromHeight:     uint32(from),
 		ToHeight:       uint32(to),
 		Contract:       contract,
+		AssetType:      assetType,
 	}, filterParam, gap
 }
 
@@ -1429,11 +1434,12 @@ func (s *PublicServer) apiUtxo(r *http.Request, apiVersion int) (interface{}, er
 		if ec != nil {
 			gap = 0
 		}
-		utxo, err = s.api.GetXpubUtxo(desc, onlyConfirmed, gap)
+		assetFilter := r.URL.Query().Get("asset")
+		utxo, err = s.api.GetXpubUtxo(desc, onlyConfirmed, gap, assetFilter)
 		if err == nil {
 			s.metrics.ExplorerViews.With(common.Labels{"action": "api-xpub-utxo"}).Inc()
 		} else {
-			utxo, err = s.api.GetAddressUtxo(desc, onlyConfirmed)
+			utxo, err = s.api.GetAddressUtxo(desc, onlyConfirmed, assetFilter)
 			s.metrics.ExplorerViews.With(common.Labels{"action": "api-address-utxo"}).Inc()
 		}
 		if err == nil && apiVersion == apiV1 {

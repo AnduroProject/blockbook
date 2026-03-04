@@ -400,6 +400,7 @@ const (
 func (d *RocksDB) ConnectBlock(block *bchain.Block) error {
 	d.connectBlockMux.Lock()
 	defer d.connectBlockMux.Unlock()
+	glog.Warningf("CONNECT-DEBUG block 1=============")
 
 	wb := grocksdb.NewWriteBatch()
 	defer wb.Destroy()
@@ -415,12 +416,14 @@ func (d *RocksDB) ConnectBlock(block *bchain.Block) error {
 	}
 
 	chainType := d.chainParser.GetChainType()
+	glog.Warningf("CONNECT-DEBUG block 0=============")
 
 	if err := d.writeHeightFromBlock(wb, block, opInsert); err != nil {
 		return err
 	}
 	addresses := make(addressesMap)
 	if chainType == bchain.ChainBitcoinType {
+		glog.Warningf("CONNECT-DEBUG block 1=============")
 		txAddressesMap := make(map[string]*TxAddresses)
 		balances := make(map[string]*AddrBalance)
 		gf, err := bchain.NewGolombFilter(d.is.BlockGolombFilterP, d.is.BlockFilterScripts, block.BlockHeader.Hash, d.is.BlockFilterUseZeroedKey)
@@ -433,6 +436,7 @@ func (d *RocksDB) ConnectBlock(block *bchain.Block) error {
 		if err := d.processAddressesBitcoinType(block, addresses, txAddressesMap, balances, gf); err != nil {
 			return err
 		}
+		glog.Warningf("CONNECT-DEBUG block=%d assetAware=%v txCount=%d", block.Height, d.assetAware, len(block.Txs))
 		if d.assetAware {
 			if err := d.processAssetsCoordinateType(block, wb, txAddressesMap, balances); err != nil {
 				return err

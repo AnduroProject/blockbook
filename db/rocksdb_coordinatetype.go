@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"math/big"
     "github.com/bsm/go-vlq"
+	"github.com/golang/glog"
 	"github.com/linxGnu/grocksdb"
 	"github.com/trezor/blockbook/bchain"
 )
@@ -212,13 +213,19 @@ func (d *RocksDB) GetAssetRegistryEntry(controller []byte) (*AssetRegistryEntry,
 	key := append([]byte(assetRegistryPrefix), controller...)
 	val, err := d.db.GetCF(d.ro, d.cfh[cfDefault], key)
 	if err != nil {
+		glog.Warningf("ASSET-DEBUG GetRegistryEntry: error=%v keyHex=%s", err, hex.EncodeToString(key))
 		return nil, err
 	}
 	defer val.Free()
 	if val.Data() == nil {
+		glog.V(1).Infof("ASSET-DEBUG GetRegistryEntry: NOT FOUND keyHex=%s ctrlHex=%s", hex.EncodeToString(key), hex.EncodeToString(controller))
 		return nil, nil
 	}
-	return d.unpackAssetRegistryEntry(val.Data())
+	entry, err := d.unpackAssetRegistryEntry(val.Data())
+	if err == nil && entry != nil {
+		glog.V(1).Infof("ASSET-DEBUG GetRegistryEntry: FOUND ticker=%q headline=%q redirect=%v", entry.Ticker, entry.Headline, entry.IsRedirect)
+	}
+	return entry, err
 }
 
 // ResolveCurrentController follows redirect chain → current controller.
@@ -542,6 +549,8 @@ func (d *RocksDB) processAssetsCoordinateType(
 	}
 	var assetTxs []assetTxEntry
 
+	glog.Infof("ASSET-DEBUG processAssetsCoordinateType: block=%d txs=%d", block.Height, len(block.Txs))
+
 	// ── Phase 1: v10 ASSET_CREATE ──────────────────────────────
 
 	for txi := range block.Txs {
@@ -549,6 +558,8 @@ func (d *RocksDB) processAssetsCoordinateType(
 		if tx.Version != 10 || len(tx.Vout) < 2 {
 			continue
 		}
+
+		glog.Infof("ASSET-DEBUG Phase1: FOUND v10 tx=%s vouts=%d coinSpecific=%v coinSpecificType=%T", tx.Txid, len(tx.Vout), tx.CoinSpecificData != nil, tx.CoinSpecificData)
 
 		btxID, err := d.chainParser.PackTxid(tx.Txid)
 		if err != nil {
@@ -630,8 +641,13 @@ func (d *RocksDB) processAssetsCoordinateType(
 			d.fillAssetMetadataFromTx(tx, entry)
 		}
 
+		glog.Infof("ASSET-DEBUG Phase1: writing registry ticker=%q headline=%q precision=%d assetType=%d supply=%s ctrlOut=%s",
+			entry.Ticker, entry.Headline, entry.Precision, entry.AssetType, entry.TotalSupply.String(), hex.EncodeToString(ctrlOut))
+
 		regKey := append([]byte(assetRegistryPrefix), ctrlOut...)
-		wb.PutCF(d.cfh[cfDefault], regKey, d.packAssetRegistryEntry(entry))
+		packed := d.packAssetRegistryEntry(entry)
+		glog.Infof("ASSET-DEBUG Phase1: regKey=%s packedLen=%d", hex.EncodeToString(regKey), len(packed))
+		wb.PutCF(d.cfh[cfDefault], regKey, packed)
 	}
 
 	// ── Phase 2: v11 ASSET_TRANSFER ────────────────────────────
@@ -711,6 +727,8 @@ func (d *RocksDB) processAssetsCoordinateType(
 	}
 
 	// ── Phase 3: Write indexes ─────────────────────────────────
+
+	glog.Infof("ASSET-DEBUG Phase3: %d affected pairs, %d assetTxs", len(affected), len(assetTxs))
 
 	// 3a. Per-address asset balances
 	for ak := range affected {
@@ -813,14 +831,17 @@ func (d *RocksDB) tagUtxoController(
 ) {
 	ta := txAddressesMap[string(btxID)]
 	if ta == nil || int(vout) >= len(ta.Outputs) {
+		glog.Warningf("ASSET-DEBUG tagUtxo: ta=%v vout=%d — ta nil or out of range", ta == nil, vout)
 		return
 	}
 	addrDesc := string(ta.Outputs[vout].AddrDesc)
 	if addrDesc == "" {
+		glog.Warningf("ASSET-DEBUG tagUtxo: empty addrDesc for vout=%d", vout)
 		return
 	}
 	bal := balances[addrDesc]
 	if bal == nil {
+		glog.Warningf("ASSET-DEBUG tagUtxo: no balance for vout=%d addrDescLen=%d", vout, len(addrDesc))
 		return
 	}
 	for i := range bal.Utxos {
@@ -828,9 +849,11 @@ func (d *RocksDB) tagUtxoController(
 		if u.Vout == vout && bytes.Equal(u.BtxID, btxID) {
 			u.Controller = controller
 			u.IsController = isController
+			glog.Infof("ASSET-DEBUG tagUtxo: TAGGED vout=%d isController=%v value=%s", vout, isController, u.ValueSat.String())
 			return
 		}
 	}
+	glog.Warningf("ASSET-DEBUG tagUtxo: UTXO NOT FOUND vout=%d, bal has %d utxos", vout, len(bal.Utxos))
 }
 
 // lookupSpentController reads controller from a spent UTXO in the DB.
@@ -918,16 +941,25 @@ func (d *RocksDB) appendToCF(wb *grocksdb.WriteBatch, key, val []byte) {
 // fillAssetMetadataFromTx extracts ticker/headline/precision/assetType from CoinSpecificData.
 func (d *RocksDB) fillAssetMetadataFromTx(tx *bchain.Tx, entry *AssetRegistryEntry) {
 	if tx.CoinSpecificData == nil {
+		glog.Warning("ASSET-DEBUG fillMetadata: CoinSpecificData is NIL for tx ", tx.Txid)
 		return
 	}
+	glog.Infof("ASSET-DEBUG fillMetadata: CoinSpecificData type=%T", tx.CoinSpecificData)
 	raw, ok := tx.CoinSpecificData.(json.RawMessage)
 	if !ok {
 		if rawBytes, ok2 := tx.CoinSpecificData.([]byte); ok2 {
 			raw = json.RawMessage(rawBytes)
+			glog.Info("ASSET-DEBUG fillMetadata: used []byte fallback")
 		} else {
+			glog.Warningf("ASSET-DEBUG fillMetadata: type assertion FAILED, type=%T", tx.CoinSpecificData)
 			return
 		}
 	}
+	preview := string(raw)
+	if len(preview) > 100 {
+		preview = preview[:100]
+	}
+	glog.Infof("ASSET-DEBUG fillMetadata: raw JSON len=%d, first100=%s", len(raw), preview)
 	var fields struct {
 		Ticker    string `json:"ticker"`
 		Headline  string `json:"headline"`
@@ -935,6 +967,7 @@ func (d *RocksDB) fillAssetMetadataFromTx(tx *bchain.Tx, entry *AssetRegistryEnt
 		AssetType int32  `json:"assettype"`
 	}
 	if err := json.Unmarshal(raw, &fields); err == nil {
+		glog.Infof("ASSET-DEBUG fillMetadata: parsed ticker=%q headline=%q precision=%d assetType=%d", fields.Ticker, fields.Headline, fields.Precision, fields.AssetType)
 		if fields.Ticker != "" {
 			entry.Ticker = fields.Ticker
 		}
@@ -945,5 +978,7 @@ func (d *RocksDB) fillAssetMetadataFromTx(tx *bchain.Tx, entry *AssetRegistryEnt
 			entry.Precision = fields.Precision
 		}
 		entry.AssetType = fields.AssetType
+	} else {
+		glog.Warningf("ASSET-DEBUG fillMetadata: json.Unmarshal FAILED: %v", err)
 	}
 }

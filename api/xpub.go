@@ -280,6 +280,83 @@ func (w *Worker) tokenFromXpubAddress(data *xpubData, ad *xpubAddress, changeInd
 	}
 }
 
+// xpubAggregateAssetTokens scans all derived addresses from an xpub and
+// aggregates Coordinate asset balances by controller outpoint.
+// Returns CoordinateAsset tokens with combined balances across all
+// xpub-derived addresses — giving a wallet-level view of asset holdings.
+func (w *Worker) xpubAggregateAssetTokens(data *xpubData, option AccountDetails, filter *AddressFilter) []Token {
+	if !w.db.IsAssetAware() || option < AccountDetailsTokens {
+		return nil
+	}
+
+	type assetAgg struct {
+		controller []byte
+		ctrlStr    string
+		balance    big.Int
+		txs        uint32
+	}
+	aggMap := make(map[string]*assetAgg)
+
+	// Scan every derived address for asset holdings
+	for _, da := range data.addresses {
+		for i := range da {
+			ad := &da[i]
+			if ad.balance == nil {
+				continue
+			}
+			assets, err := w.db.GetAddrDescAssets(ad.addrDesc)
+			if err != nil || len(assets) == 0 {
+				continue
+			}
+			for _, a := range assets {
+				ctrlStr := w.db.FormatControllerOutpoint(a.Controller)
+				agg, exists := aggMap[ctrlStr]
+				if !exists {
+					agg = &assetAgg{
+						controller: a.Controller,
+						ctrlStr:    ctrlStr,
+					}
+					aggMap[ctrlStr] = agg
+				}
+				agg.balance.Add(&agg.balance, &a.Balance.BalanceSat)
+				agg.txs += a.Balance.Txs
+			}
+		}
+	}
+
+	if len(aggMap) == 0 {
+		return nil
+	}
+
+	tokens := make([]Token, 0, len(aggMap))
+	for _, agg := range aggMap {
+		bal := new(big.Int).Set(&agg.balance)
+		t := Token{
+			Standard:   bchain.CoordinateAssetStandard,
+			Type:       bchain.CoordinateAssetStandard,
+			Contract:   agg.ctrlStr,
+			Transfers:  int(agg.txs),
+			BalanceSat: (*Amount)(bal),
+		}
+		// Fetch metadata from asset registry
+		entry, err := w.db.GetAssetRegistryEntry(agg.controller)
+		// Filter by asset type if requested
+		if filter != nil && filter.AssetType > 0 {
+			if err != nil || entry == nil || entry.IsRedirect || int(entry.AssetType) != filter.AssetType {
+				continue
+			}
+		}
+		if err == nil && entry != nil && !entry.IsRedirect {
+			t.Name = entry.Headline
+			t.Symbol = entry.Ticker
+			t.Decimals = int(entry.Precision)
+			t.AssetType = int(entry.AssetType)
+		}
+		tokens = append(tokens, t)
+	}
+	return tokens
+}
+
 // returns true if addresses are "own", i.e. the address belongs to the xpub
 func isOwnAddresses(xpubAddresses map[string]struct{}, addresses []string) bool {
 	if len(addresses) == 1 {
@@ -569,6 +646,11 @@ func (w *Worker) GetXpubAddress(xpub string, page int, txsOnPage int, option Acc
 		}
 	}
 	setIsOwnAddresses(txs, xpubAddresses)
+	// Aggregate Coordinate asset tokens across all xpub-derived addresses
+	assetTokens := w.xpubAggregateAssetTokens(data, option, filter)
+	if len(assetTokens) > 0 {
+		tokens = append(tokens, assetTokens...)
+	}
 	var totalReceived big.Int
 	totalReceived.Add(&data.balanceSat, &data.sentSat)
 
@@ -608,7 +690,7 @@ func (w *Worker) GetXpubAddress(xpub string, page int, txsOnPage int, option Acc
 }
 
 // GetXpubUtxo returns unspent outputs for given xpub
-func (w *Worker) GetXpubUtxo(xpub string, onlyConfirmed bool, gap int) (Utxos, error) {
+func (w *Worker) GetXpubUtxo(xpub string, onlyConfirmed bool, gap int, assetFilter string) (Utxos, error) {
 	start := time.Now()
 	xd, err := w.chainParser.ParseXpub(xpub)
 	if err != nil {
@@ -632,7 +714,7 @@ func (w *Worker) GetXpubUtxo(xpub string, onlyConfirmed bool, gap int) (Utxos, e
 				}
 				onlyMempool = true
 			}
-			utxos, err := w.getAddrDescUtxo(ad.addrDesc, ad.balance, onlyConfirmed, onlyMempool)
+			utxos, err := w.getAddrDescUtxo(ad.addrDesc, ad.balance, onlyConfirmed, onlyMempool, assetFilter)
 			if err != nil {
 				return nil, err
 			}

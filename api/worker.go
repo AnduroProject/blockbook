@@ -1830,7 +1830,7 @@ func (w *Worker) waitForBackendSync() {
 	}
 }
 
-func (w *Worker) getAddrDescUtxo(addrDesc bchain.AddressDescriptor, ba *db.AddrBalance, onlyConfirmed bool, onlyMempool bool) (Utxos, error) {
+func (w *Worker) getAddrDescUtxo(addrDesc bchain.AddressDescriptor, ba *db.AddrBalance, onlyConfirmed bool, onlyMempool bool, assetFilter string) (Utxos, error) {
 	w.waitForBackendSync()
 	var err error
 	utxos := make(Utxos, 0, 8)
@@ -1881,6 +1881,10 @@ func (w *Worker) getAddrDescUtxo(addrDesc bchain.AddressDescriptor, ba *db.AddrB
 									Locktime:  bchainTx.LockTime,
 									Coinbase:  coinbase,
 								})
+								// Tag mempool asset UTXOs with controller
+								if w.db.IsAssetAware() {
+									w.tagMempoolAssetUtxo(bchainTx, i, &utxos[len(utxos)-1])
+								}
 								inMempool[bchainTx.Txid] = struct{}{}
 							}
 						}
@@ -1951,11 +1955,21 @@ func (w *Worker) getAddrDescUtxo(addrDesc bchain.AddressDescriptor, ba *db.AddrB
 			}
 		}
 	}
+	// Filter by asset controller if requested
+	if assetFilter != "" && len(utxos) > 0 {
+		filtered := make(Utxos, 0, len(utxos))
+		for i := range utxos {
+			if utxos[i].Controller == assetFilter {
+				filtered = append(filtered, utxos[i])
+			}
+		}
+		utxos = filtered
+	}
 	return utxos, nil
 }
 
 // GetAddressUtxo returns unspent outputs for given address
-func (w *Worker) GetAddressUtxo(address string, onlyConfirmed bool) (Utxos, error) {
+func (w *Worker) GetAddressUtxo(address string, onlyConfirmed bool, assetFilter string) (Utxos, error) {
 	if w.chainType != bchain.ChainBitcoinType {
 		return nil, NewAPIError("Not supported", true)
 	}
@@ -1964,7 +1978,7 @@ func (w *Worker) GetAddressUtxo(address string, onlyConfirmed bool) (Utxos, erro
 	if err != nil {
 		return nil, NewAPIError(fmt.Sprintf("Invalid address '%v', %v", address, err), true)
 	}
-	r, err := w.getAddrDescUtxo(addrDesc, nil, onlyConfirmed, false)
+	r, err := w.getAddrDescUtxo(addrDesc, nil, onlyConfirmed, false, assetFilter)
 	if err != nil {
 		return nil, err
 	}
@@ -2710,6 +2724,16 @@ func (w *Worker) getCoordinateAssetData(
             continue
         }
 
+        // Fetch asset metadata from registry (needed for AssetType filter + display)
+        entry, err := w.db.GetAssetRegistryEntry(a.Controller)
+
+        // If filtering by asset type, skip non-matching
+        if filter.AssetType > 0 {
+            if err != nil || entry == nil || entry.IsRedirect || int(entry.AssetType) != filter.AssetType {
+                continue
+            }
+        }
+
         t := Token{
             Standard:   bchain.CoordinateAssetStandard,
             Type:       bchain.CoordinateAssetStandard,
@@ -2718,12 +2742,11 @@ func (w *Worker) getCoordinateAssetData(
             BalanceSat: (*Amount)(&a.Balance.BalanceSat),
         }
 
-        // Fetch asset metadata from registry
-        entry, err := w.db.GetAssetRegistryEntry(a.Controller)
         if err == nil && entry != nil && !entry.IsRedirect {
             t.Name = entry.Headline
             t.Symbol = entry.Ticker
             t.Decimals = int(entry.Precision)
+            t.AssetType = int(entry.AssetType)
         }
 
         tokens = append(tokens, t)
@@ -2809,6 +2832,31 @@ func (w *Worker) GetAsset(controller string, page, txsOnPage int, option Account
         r.TotalSupply = (*Amount)(&entry.TotalSupply)
     }
 
+    // Scan mempool for unconfirmed asset transactions
+    ctrlStr := r.Controller
+    var mempoolTxids []string
+    if mEntries := w.mempool.GetAllEntries(); len(mEntries) > 0 && len(mEntries) <= 10000 {
+        for _, me := range mEntries {
+            bchainTx, _, txErr := w.txCache.GetTransaction(me.Txid)
+            if txErr != nil || bchainTx == nil {
+                continue
+            }
+            if bchainTx.Version == 10 {
+                // ASSET_CREATE: controller = txid:0
+                if me.Txid+":0" == ctrlStr {
+                    mempoolTxids = append(mempoolTxids, me.Txid)
+                }
+            } else if bchainTx.Version == 11 {
+                // ASSET_TRANSFER: check if any input carries this controller
+                inputCtrl := w.findAssetControllerFromInputs(bchainTx)
+                if inputCtrl == ctrlStr {
+                    mempoolTxids = append(mempoolTxids, me.Txid)
+                }
+            }
+        }
+    }
+    r.UnconfirmedTxs = len(mempoolTxids)
+
     // Get tx history
     if option >= AccountDetailsTxidHistory {
         txids := make([]string, 0, 32)
@@ -2821,6 +2869,10 @@ func (w *Worker) GetAsset(controller string, page, txsOnPage int, option Account
             return nil, err
         }
 
+        // Prepend mempool txids (unconfirmed first)
+        if len(mempoolTxids) > 0 {
+            txids = append(mempoolTxids, txids...)
+        }
         r.Txs = len(txids)
 
         // Paginate
@@ -2853,4 +2905,76 @@ func (w *Worker) GetAsset(controller string, page, txsOnPage int, option Account
     }
 
     return r, nil
+}
+
+// tagMempoolAssetUtxo detects asset transactions in the mempool and tags
+// their outputs with the appropriate controller outpoint.
+func (w *Worker) tagMempoolAssetUtxo(tx *bchain.Tx, voutIdx int, utxo *Utxo) {
+	if tx.Version == 10 && len(tx.Vout) >= 2 {
+		// ASSET_CREATE: vout[0] = controller, vout[1] = supply
+		ctrl := tx.Txid + ":0"
+		if voutIdx <= 1 {
+			utxo.Controller = ctrl
+			utxo.IsController = (voutIdx == 0)
+		}
+	} else if tx.Version == 11 {
+		// ASSET_TRANSFER: find the controller from spent inputs
+		ctrl := w.findAssetControllerFromInputs(tx)
+		if ctrl != "" {
+			utxo.Controller = ctrl
+			utxo.IsController = (voutIdx == 0) // new controller is always vout[0]
+		}
+	}
+}
+
+// findAssetControllerFromInputs looks up the controller outpoint from the
+// inputs of an ASSET_TRANSFER tx. It first checks vin.AssetId (populated by
+// the parser from the daemon JSON), then falls back to a DB UTXO lookup.
+func (w *Worker) findAssetControllerFromInputs(tx *bchain.Tx) string {
+	// Fast path: parser may have set AssetId from daemon JSON
+	for i := range tx.Vin {
+		if tx.Vin[i].AssetId != "" {
+			return tx.Vin[i].AssetId
+		}
+	}
+	// Slow path: look up confirmed UTXO in DB
+	for i := range tx.Vin {
+		vin := &tx.Vin[i]
+		if vin.Txid == "" {
+			continue
+		}
+		ctrl := w.lookupUtxoController(vin.Txid, vin.Vout)
+		if ctrl != "" {
+			return ctrl
+		}
+	}
+	return ""
+}
+
+// lookupUtxoController finds the controller string for a specific UTXO
+// by looking it up in the confirmed balance/UTXO set in the DB.
+func (w *Worker) lookupUtxoController(txid string, vout uint32) string {
+	btxID, err := w.chainParser.PackTxid(txid)
+	if err != nil {
+		return ""
+	}
+	// Get the previous tx to find which address owns this output
+	prevTx, _, err := w.txCache.GetTransaction(txid)
+	if err != nil || prevTx == nil || int(vout) >= len(prevTx.Vout) {
+		return ""
+	}
+	addrDesc, err := w.chainParser.GetAddrDescFromVout(&prevTx.Vout[vout])
+	if err != nil || len(addrDesc) == 0 {
+		return ""
+	}
+	ba, err := w.db.GetAddrDescBalance(addrDesc, db.AddressBalanceDetailUTXO)
+	if err != nil || ba == nil {
+		return ""
+	}
+	for _, u := range ba.Utxos {
+		if bytes.Equal(u.BtxID, btxID) && u.Vout == int32(vout) && len(u.Controller) > 0 {
+			return w.db.FormatControllerOutpoint(u.Controller)
+		}
+	}
+	return ""
 }

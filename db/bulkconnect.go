@@ -282,6 +282,19 @@ func (b *BulkConnect) connectBlockBitcoinType(block *bchain.Block, storeBlockTxs
 	if err := b.d.processAddressesBitcoinType(block, addresses, b.txAddressesMap, b.balances, gf); err != nil {
 		return err
 	}
+	// Process asset indexes during bulk sync (registry, tx history, UTXO tagging)
+	if b.d.assetAware {
+		awb := grocksdb.NewWriteBatch()
+		if err := b.d.processAssetsCoordinateType(block, awb, b.txAddressesMap, b.balances); err != nil {
+			awb.Destroy()
+			return err
+		}
+		if err := b.d.WriteBatch(awb); err != nil {
+			awb.Destroy()
+			return err
+		}
+		awb.Destroy()
+	}
 	var storeAddressesChan, storeBalancesChan chan error
 	var sa bool
 	if len(b.txAddressesMap) > maxBulkTxAddresses || len(b.balances) > maxBulkBalances {
