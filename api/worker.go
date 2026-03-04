@@ -2728,7 +2728,7 @@ func (w *Worker) getCoordinateAssetData(
         entry, err := w.db.GetAssetRegistryEntry(a.Controller)
 
         // If filtering by asset type, skip non-matching
-        if filter.AssetType > 0 {
+        if filter.AssetType >= 0 {
             if err != nil || entry == nil || entry.IsRedirect || int(entry.AssetType) != filter.AssetType {
                 continue
             }

@@ -901,7 +901,7 @@ func (s *PublicServer) getAddressQueryParams(r *http.Request, accountDetails api
 		gap = 0
 	}
 	contract := r.URL.Query().Get("contract")
-	assetType := 0
+	assetType := -1
 	if at := r.URL.Query().Get("assettype"); at != "" {
 		assetType, _ = strconv.Atoi(at)
 	}

@@ -341,7 +341,7 @@ func (w *Worker) xpubAggregateAssetTokens(data *xpubData, option AccountDetails,
 		// Fetch metadata from asset registry
 		entry, err := w.db.GetAssetRegistryEntry(agg.controller)
 		// Filter by asset type if requested
-		if filter != nil && filter.AssetType > 0 {
+		if filter != nil && filter.AssetType >= 0 {
 			if err != nil || entry == nil || entry.IsRedirect || int(entry.AssetType) != filter.AssetType {
 				continue
 			}

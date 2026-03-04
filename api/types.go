@@ -347,8 +347,8 @@ type AddressFilter struct {
 	TokensToReturn TokensToReturn `ts_doc:"Which tokens to include in the result set."`
 	// OnlyConfirmed set to true will ignore mempool transactions; mempool is also ignored if FromHeight/ToHeight filter is specified
 	OnlyConfirmed bool `ts_doc:"If true, ignores mempool (unconfirmed) transactions."`
-	// AssetType filters Coordinate asset tokens by their asset type. 0 means no filter, >0 filters by specific type.
-	AssetType int `ts_doc:"Filter Coordinate asset tokens by asset type (0 = no filter, >0 = specific type)."`
+	// AssetType filters Coordinate asset tokens by their asset type. -1 means no filter (default when param absent).
+	AssetType int `ts_doc:"Filter Coordinate asset tokens by asset type (-1 = no filter, 0+ = specific type)."`
 }
 
 // StakingPool holds data about address participation in a staking pool contract
