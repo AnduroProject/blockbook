@@ -616,7 +616,6 @@ func (d *RocksDB) processAssetsCoordinateType(
 		supply := &tx.Vout[1].ValueSat
 		entry := &AssetRegistryEntry{
 			CurrentController: ctrlOut,
-			Precision:         8,
 		}
 
 		if oldCtrl != nil && !bytes.Equal(oldCtrl, ctrlOut) {
@@ -1012,9 +1011,8 @@ func (d *RocksDB) fillAssetMetadataFromTx(tx *bchain.Tx, entry *AssetRegistryEnt
 		if fields.Headline != "" {
 			entry.Headline = fields.Headline
 		}
-		if fields.Precision > 0 {
-			entry.Precision = fields.Precision
-		}
+		// Always set precision — 0 is valid (e.g. NFTs)
+		entry.Precision = fields.Precision
 		entry.AssetType = fields.AssetType
 	} else {
 		glog.Warningf("ASSET-DEBUG fillMetadata: json.Unmarshal FAILED: %v", err)
