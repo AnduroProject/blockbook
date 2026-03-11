@@ -1398,11 +1398,22 @@ func (w *Worker) GetAddress(address string, page int, txsOnPage int, option Acco
 		totalResults = ed.totalResults
 	} else {
 		// ba can be nil if the address is only in mempool!
-		ba, err = w.db.GetAddrDescBalance(addrDesc, db.AddressBalanceDetailNoUTXO)
+		// For asset-aware chains, load UTXOs so we can recompute the CBTC-only balance
+		var detail db.AddressBalanceDetail = db.AddressBalanceDetailNoUTXO
+		if w.db.IsAssetAware() {
+			detail = db.AddressBalanceDetailUTXO
+		}
+		ba, err = w.db.GetAddrDescBalance(addrDesc, detail)
 		if err != nil {
 			return nil, NewAPIError(fmt.Sprintf("Address not found, %v", err), true)
 		}
 		if ba != nil {
+			// On asset-aware chains, recompute BalanceSat to exclude asset UTXOs
+			if w.db.IsAssetAware() {
+				if adjusted := ba.CBTCBalanceFromUtxos(); adjusted != nil {
+					ba.BalanceSat.Set(adjusted)
+				}
+			}
 			// totalResults is known only if there is no filter
 			if filter.Vout == AddressFilterVoutOff && filter.FromHeight == 0 && filter.ToHeight == 0 {
 				totalResults = int(ba.Txs)
@@ -1948,7 +1959,11 @@ func (w *Worker) getAddrDescUtxo(addrDesc bchain.AddressDescriptor, ba *db.AddrB
 						utxos = append(utxos, u)
 					}
 				}
-				checksum.Sub(&checksum, &utxo.ValueSat)
+				// Only subtract non-asset UTXOs from the checksum, since
+				// BalanceSat excludes asset-tagged UTXOs on asset-aware chains.
+				if !w.db.IsAssetAware() || len(utxo.Controller) == 0 {
+					checksum.Sub(&checksum, &utxo.ValueSat)
+				}
 			}
 			if checksum.Uint64() != 0 {
 				glog.Warning("DB inconsistency:  ", addrDesc, ": checksum is not zero, checksum=", checksum.Int64())

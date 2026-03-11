@@ -196,6 +196,12 @@ func (w *Worker) xpubDerivedAddressBalance(data *xpubData, ad *xpubAddress) (boo
 	if ad.balance != nil {
 		data.txCountEstimate += ad.balance.Txs
 		data.sentSat.Add(&data.sentSat, &ad.balance.SentSat)
+		// On asset-aware chains, recompute BalanceSat excluding asset UTXOs
+		if w.db.IsAssetAware() {
+			if adjusted := ad.balance.CBTCBalanceFromUtxos(); adjusted != nil {
+				ad.balance.BalanceSat.Set(adjusted)
+			}
+		}
 		data.balanceSat.Add(&data.balanceSat, &ad.balance.BalanceSat)
 		return true, nil
 	}
@@ -569,21 +575,50 @@ func (w *Worker) GetXpubAddress(xpub string, page int, txsOnPage int, option Acc
 	if option >= AccountDetailsTxidHistory {
 		txcMap := make(map[string]bool)
 		txc = make(xpubTxids, 0, 32)
-		for _, da := range data.addresses {
-			for i := range da {
-				ad := &da[i]
-				for _, txid := range ad.txids {
-					added, foundTx := txcMap[txid.txid]
-					// count txs regardless of filter but only once
-					if !foundTx {
-						txCount++
+
+		// When filtering by Coordinate asset contract, use the per-address per-asset (ax:) index
+		// instead of the preloaded txids which contain ALL transactions for each address.
+		if w.db.IsAssetAware() && filter.Contract != "" {
+			for _, da := range data.addresses {
+				for i := range da {
+					ad := &da[i]
+					assetTxids, err := w.getAssetFilteredTxids(ad.addrDesc, filter, maxInt)
+					if err != nil {
+						continue
 					}
-					// add tx only once
-					if !added {
-						add := txidFilter == nil || txidFilter(&txid, ad)
-						txcMap[txid.txid] = add
-						if add {
-							txc = append(txc, txid)
+					for _, txidStr := range assetTxids {
+						if _, found := txcMap[txidStr]; !found {
+							txcMap[txidStr] = true
+							txc = append(txc, xpubTxid{txid: txidStr, height: 0})
+							txCount++
+						}
+					}
+				}
+			}
+			// Re-fetch heights for proper sorting
+			for idx := range txc {
+				ta, err := w.db.GetTxAddresses(txc[idx].txid)
+				if err == nil && ta != nil {
+					txc[idx].height = ta.Height
+				}
+			}
+		} else {
+			for _, da := range data.addresses {
+				for i := range da {
+					ad := &da[i]
+					for _, txid := range ad.txids {
+						added, foundTx := txcMap[txid.txid]
+						// count txs regardless of filter but only once
+						if !foundTx {
+							txCount++
+						}
+						// add tx only once
+						if !added {
+							add := txidFilter == nil || txidFilter(&txid, ad)
+							txcMap[txid.txid] = add
+							if add {
+								txc = append(txc, txid)
+							}
 						}
 					}
 				}

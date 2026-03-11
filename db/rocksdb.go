@@ -441,6 +441,8 @@ func (d *RocksDB) ConnectBlock(block *bchain.Block) error {
 			if err := d.processAssetsCoordinateType(block, wb, txAddressesMap, balances); err != nil {
 				return err
 			}
+			// Recompute BalanceSat to exclude asset-tagged UTXOs (supply + controller)
+			adjustBalancesForAssets(balances)
 		}
 		
 		if d.metrics != nil {
@@ -606,6 +608,33 @@ func (ab *AddrBalance) ReceivedSat() *big.Int {
 	var r big.Int
 	r.Add(&ab.BalanceSat, &ab.SentSat)
 	return &r
+}
+
+// CBTCBalanceFromUtxos recomputes balance from non-asset UTXOs only.
+// Returns nil if no UTXOs are loaded (detail was NoUTXO).
+// Used on asset-aware chains to exclude controller/supply outputs from the coin balance.
+func (ab *AddrBalance) CBTCBalanceFromUtxos() *big.Int {
+	if len(ab.Utxos) == 0 {
+		return nil
+	}
+	hasAsset := false
+	for i := range ab.Utxos {
+		if ab.Utxos[i].Vout >= 0 && len(ab.Utxos[i].Controller) > 0 {
+			hasAsset = true
+			break
+		}
+	}
+	if !hasAsset {
+		return &ab.BalanceSat
+	}
+	var bal big.Int
+	for i := range ab.Utxos {
+		u := &ab.Utxos[i]
+		if u.Vout >= 0 && len(u.Controller) == 0 {
+			bal.Add(&bal, &u.ValueSat)
+		}
+	}
+	return &bal
 }
 
 // addUtxo

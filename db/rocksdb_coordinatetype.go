@@ -735,11 +735,11 @@ func (d *RocksDB) processAssetsCoordinateType(
 		addrDesc := bchain.AddressDescriptor(ak.addrDesc)
 		ctrl := []byte(ak.controller)
 
-		// Compute current balance from live UTXOs
+		// Compute current balance from live UTXOs (exclude controller output — it's ownership, not supply)
 		var assetBal big.Int
 		if bal := balances[ak.addrDesc]; bal != nil {
 			for _, u := range bal.Utxos {
-				if u.Vout >= 0 && bytes.Equal(u.Controller, ctrl) {
+				if u.Vout >= 0 && bytes.Equal(u.Controller, ctrl) && !u.IsController {
 					assetBal.Add(&assetBal, &u.ValueSat)
 				}
 			}
@@ -820,6 +820,44 @@ func uitoa(v uint32) string {
 		buf[i], buf[j] = buf[j], buf[i]
 	}
 	return string(buf)
+}
+
+// adjustBalancesForAssets recomputes BalanceSat for every address that has
+// asset-tagged UTXOs. After processAssetsCoordinateType tags outputs with
+// Controller, the raw BalanceSat (set by processAddressesBitcoinType) still
+// includes asset supply/controller values. This function corrects that by
+// summing only non-asset UTXOs.
+//
+// Must be called AFTER processAssetsCoordinateType and BEFORE storeBalances.
+func adjustBalancesForAssets(balances map[string]*AddrBalance) {
+	for _, bal := range balances {
+		if len(bal.Utxos) == 0 {
+			continue
+		}
+		// Quick check: does this address have any asset-tagged UTXOs?
+		hasAsset := false
+		for i := range bal.Utxos {
+			if bal.Utxos[i].Vout >= 0 && len(bal.Utxos[i].Controller) > 0 {
+				hasAsset = true
+				break
+			}
+		}
+		if !hasAsset {
+			continue
+		}
+		// Recompute BalanceSat from non-asset UTXOs only
+		var nonAssetBalance big.Int
+		for i := range bal.Utxos {
+			u := &bal.Utxos[i]
+			if u.Vout < 0 { // spent
+				continue
+			}
+			if len(u.Controller) == 0 {
+				nonAssetBalance.Add(&nonAssetBalance, &u.ValueSat)
+			}
+		}
+		bal.BalanceSat.Set(&nonAssetBalance)
+	}
 }
 
 // tagUtxoController sets Controller on a UTXO in the balances map.
