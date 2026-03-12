@@ -357,6 +357,9 @@ func (w *Worker) xpubAggregateAssetTokens(data *xpubData, option AccountDetails,
 			t.Symbol = entry.Ticker
 			t.Decimals = int(entry.Precision)
 			t.AssetType = int(entry.AssetType)
+			if len(entry.AssetId) > 0 {
+				t.AssetId = db.FormatAssetId(entry.AssetId)
+			}
 		}
 		tokens = append(tokens, t)
 	}

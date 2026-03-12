@@ -1955,6 +1955,14 @@ func (w *Worker) getAddrDescUtxo(addrDesc bchain.AddressDescriptor, ba *db.AddrB
 						if len(utxo.Controller) > 0 {
 							u.Controller = w.db.FormatControllerOutpoint(utxo.Controller)
 							u.IsController = utxo.IsController
+							if !utxo.IsController {
+								// Look up chain-level asset ID from registry
+								resolved := w.db.ResolveCurrentController(utxo.Controller)
+								entry, err := w.db.GetAssetRegistryEntry(resolved)
+								if err == nil && entry != nil && !entry.IsRedirect && len(entry.AssetId) > 0 {
+									u.AssetId = db.FormatAssetId(entry.AssetId)
+								}
+							}
 						}
 						utxos = append(utxos, u)
 					}
@@ -2762,6 +2770,9 @@ func (w *Worker) getCoordinateAssetData(
             t.Symbol = entry.Ticker
             t.Decimals = int(entry.Precision)
             t.AssetType = int(entry.AssetType)
+            if len(entry.AssetId) > 0 {
+                t.AssetId = db.FormatAssetId(entry.AssetId)
+            }
         }
 
         tokens = append(tokens, t)
@@ -2845,6 +2856,9 @@ func (w *Worker) GetAsset(controller string, page, txsOnPage int, option Account
         r.Precision = int(entry.Precision)
         r.AssetType = int(entry.AssetType)
         r.TotalSupply = (*Amount)(&entry.TotalSupply)
+        if len(entry.AssetId) > 0 {
+            r.AssetId = db.FormatAssetId(entry.AssetId)
+        }
     }
 
     // Scan mempool for unconfirmed asset transactions
@@ -2931,13 +2945,27 @@ func (w *Worker) tagMempoolAssetUtxo(tx *bchain.Tx, voutIdx int, utxo *Utxo) {
 		if voutIdx <= 1 {
 			utxo.Controller = ctrl
 			utxo.IsController = (voutIdx == 0)
+			if voutIdx != 0 {
+				// Mempool v10: asset not yet in registry, assetId unavailable until confirmed
+				utxo.AssetId = ""
+			}
 		}
 	} else if tx.Version == 11 {
-		// ASSET_TRANSFER: find the controller from spent inputs
+		// ASSET_TRANSFER: no controller output in v11
+		// For mempool, tag output with controller + assetId for wallet use
 		ctrl := w.findAssetControllerFromInputs(tx)
 		if ctrl != "" {
 			utxo.Controller = ctrl
-			utxo.IsController = (voutIdx == 0) // new controller is always vout[0]
+			utxo.IsController = false
+			// Look up chain-level asset ID from registry
+			ctrlBytes, err := w.db.ParseControllerString(ctrl)
+			if err == nil && ctrlBytes != nil {
+				resolved := w.db.ResolveCurrentController(ctrlBytes)
+				entry, err := w.db.GetAssetRegistryEntry(resolved)
+				if err == nil && entry != nil && !entry.IsRedirect && len(entry.AssetId) > 0 {
+					utxo.AssetId = db.FormatAssetId(entry.AssetId)
+				}
+			}
 		}
 	}
 }

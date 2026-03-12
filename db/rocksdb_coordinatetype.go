@@ -137,6 +137,26 @@ type AssetRegistryEntry struct {
 	TotalSupply       big.Int
 	CurrentController []byte
 	IsRedirect        bool
+	AssetId           []byte // 11 bytes: 8-byte block height (BE) + 3-byte ASCII index ("001")
+}
+
+// CreateAssetId builds the 11-byte asset identifier matching Coordinate Core:
+// 8 bytes block height (big-endian) + 3 bytes ASCII asset index ("001", "002", etc.)
+func CreateAssetId(blockHeight uint32, assetIndex uint16) []byte {
+	id := make([]byte, 11)
+	// 8 bytes big-endian block height (upper 4 bytes are zero for uint32)
+	binary.BigEndian.PutUint32(id[0:4], 0)
+	binary.BigEndian.PutUint32(id[4:8], blockHeight)
+	// 3-digit zero-padded ASCII index
+	id[8] = byte('0' + (assetIndex/100)%10)
+	id[9] = byte('0' + (assetIndex/10)%10)
+	id[10] = byte('0' + assetIndex%10)
+	return id
+}
+
+// FormatAssetId returns hex-encoded string of the 11-byte asset ID.
+func FormatAssetId(assetId []byte) string {
+	return hex.EncodeToString(assetId)
 }
 
 func (d *RocksDB) packAssetRegistryEntry(e *AssetRegistryEntry) []byte {
@@ -167,6 +187,10 @@ func (d *RocksDB) packAssetRegistryEntry(e *AssetRegistryEntry) []byte {
 	l = packVaruint(uint(len(e.CurrentController)), varBuf[:])
 	buf = append(buf, varBuf[:l]...)
 	buf = append(buf, e.CurrentController...)
+	// assetId
+	l = packVaruint(uint(len(e.AssetId)), varBuf[:])
+	buf = append(buf, varBuf[:l]...)
+	buf = append(buf, e.AssetId...)
 	return buf
 }
 
@@ -205,6 +229,16 @@ func (d *RocksDB) unpackAssetRegistryEntry(data []byte) (*AssetRegistryEntry, er
 	ctrlLen, l := unpackVaruint(data[p:])
 	p += l
 	e.CurrentController = append([]byte(nil), data[p:p+int(ctrlLen)]...)
+	p += int(ctrlLen)
+
+	// assetId (may not exist in old data)
+	if p < len(data) {
+		aidLen, l := unpackVaruint(data[p:])
+		p += l
+		if aidLen > 0 && p+int(aidLen) <= len(data) {
+			e.AssetId = append([]byte(nil), data[p:p+int(aidLen)]...)
+		}
+	}
 	return e, nil
 }
 
@@ -553,11 +587,15 @@ func (d *RocksDB) processAssetsCoordinateType(
 
 	// ── Phase 1: v10 ASSET_CREATE ──────────────────────────────
 
+	var assetIncr uint16 // counter for asset ID generation within this block
+
 	for txi := range block.Txs {
 		tx := &block.Txs[txi]
 		if tx.Version != 10 || len(tx.Vout) < 2 {
 			continue
 		}
+
+		assetIncr++
 
 		glog.Infof("ASSET-DEBUG Phase1: FOUND v10 tx=%s vouts=%d coinSpecific=%v coinSpecificType=%T", tx.Txid, len(tx.Vout), tx.CoinSpecificData != nil, tx.CoinSpecificData)
 
@@ -580,7 +618,7 @@ func (d *RocksDB) processAssetsCoordinateType(
 			}
 			ci := ctrlMap[opKey(vin.Txid, vin.Vout)]
 			if ci == nil {
-				ci = d.lookupSpentController(vin.Txid, vin.Vout, txAddressesMap)
+				ci = d.lookupSpentController(vin.Txid, vin.Vout, txAddressesMap, balances)
 			}
 			if ci != nil && ci.IsController {
 				oldCtrl = ci.Controller
@@ -619,29 +657,32 @@ func (d *RocksDB) processAssetsCoordinateType(
 		}
 
 		if oldCtrl != nil && !bytes.Equal(oldCtrl, ctrlOut) {
-			// Mint-more: carry forward metadata, add supply
+			// Mint-more: carry forward metadata + assetId, add supply
 			oldEntry, _ := d.GetAssetRegistryEntry(oldCtrl)
 			if oldEntry != nil && !oldEntry.IsRedirect {
 				entry.Ticker = oldEntry.Ticker
 				entry.Headline = oldEntry.Headline
 				entry.Precision = oldEntry.Precision
 				entry.AssetType = oldEntry.AssetType
+				entry.AssetId = oldEntry.AssetId // keep original asset ID
 				entry.TotalSupply.Add(&oldEntry.TotalSupply, supply)
 			} else {
 				entry.TotalSupply.Set(supply)
+				entry.AssetId = CreateAssetId(block.Height, assetIncr)
 			}
 			// Write redirect: old → new
 			redirect := &AssetRegistryEntry{IsRedirect: true, CurrentController: ctrlOut}
 			rKey := append([]byte(assetRegistryPrefix), oldCtrl...)
 			wb.PutCF(d.cfh[cfDefault], rKey, d.packAssetRegistryEntry(redirect))
 		} else {
-			// First creation
+			// First creation — generate new asset ID
 			entry.TotalSupply.Set(supply)
+			entry.AssetId = CreateAssetId(block.Height, assetIncr)
 			d.fillAssetMetadataFromTx(tx, entry)
 		}
 
-		glog.Infof("ASSET-DEBUG Phase1: writing registry ticker=%q headline=%q precision=%d assetType=%d supply=%s ctrlOut=%s",
-			entry.Ticker, entry.Headline, entry.Precision, entry.AssetType, entry.TotalSupply.String(), hex.EncodeToString(ctrlOut))
+		glog.Infof("ASSET-DEBUG Phase1: writing registry ticker=%q headline=%q precision=%d assetType=%d supply=%s assetId=%s ctrlOut=%s",
+			entry.Ticker, entry.Headline, entry.Precision, entry.AssetType, entry.TotalSupply.String(), hex.EncodeToString(entry.AssetId), hex.EncodeToString(ctrlOut))
 
 		regKey := append([]byte(assetRegistryPrefix), ctrlOut...)
 		packed := d.packAssetRegistryEntry(entry)
@@ -656,6 +697,8 @@ func (d *RocksDB) processAssetsCoordinateType(
 		if tx.Version != 11 {
 			continue
 		}
+
+		glog.Infof("ASSET-DEBUG Phase2: FOUND v11 tx=%s vins=%d vouts=%d", tx.Txid, len(tx.Vin), len(tx.Vout))
 
 		btxID, err := d.chainParser.PackTxid(tx.Txid)
 		if err != nil {
@@ -674,38 +717,41 @@ func (d *RocksDB) processAssetsCoordinateType(
 			}
 			ci := ctrlMap[opKey(vin.Txid, vin.Vout)]
 			if ci == nil {
-				ci = d.lookupSpentController(vin.Txid, vin.Vout, txAddressesMap)
+				ci = d.lookupSpentController(vin.Txid, vin.Vout, txAddressesMap, balances)
+			} else {
+				glog.V(1).Infof("ASSET-DEBUG Phase2: vin[%d] found in ctrlMap, isCtrl=%v", i, ci.IsController)
 			}
 			if ci == nil || len(ci.Controller) == 0 {
+				glog.V(1).Infof("ASSET-DEBUG Phase2: vin[%d] txid=%s vout=%d — NO controller found", i, vin.Txid, vin.Vout)
 				continue
 			}
-			if ci.IsController {
-				// Controller coins don't count toward fill amount
-				if controller == nil {
-					controller = ci.Controller
-				}
-			} else {
-				// Asset supply input: sum value
+			// Sum non-controller asset input values
+			if !ci.IsController {
 				if ta != nil && i < len(ta.Inputs) {
 					assetTotal.Add(&assetTotal, &ta.Inputs[i].ValueSat)
+					glog.Infof("ASSET-DEBUG Phase2: vin[%d] asset input value=%s runningTotal=%s", i, ta.Inputs[i].ValueSat.String(), assetTotal.String())
 				}
-				if controller == nil {
-					controller = ci.Controller
-				}
+			} else {
+				glog.Infof("ASSET-DEBUG Phase2: vin[%d] is CONTROLLER input, skipping value", i)
+			}
+			if controller == nil {
+				controller = ci.Controller
 			}
 			// Track input address
 			if ta != nil && i < len(ta.Inputs) && len(ta.Inputs[i].AddrDesc) > 0 {
-				affected[addrAssetKey{string(ta.Inputs[i].AddrDesc), string(controller)}] = true
+				affected[addrAssetKey{string(ta.Inputs[i].AddrDesc), string(ci.Controller)}] = true
 			}
 		}
 
 		if controller == nil || assetTotal.Sign() == 0 {
+			glog.Warningf("ASSET-DEBUG Phase2: SKIPPING v11 tx=%s controller=%v assetTotal=%s", tx.Txid, controller != nil, assetTotal.String())
 			continue
 		}
 
 		resolved := d.ResolveCurrentController(controller)
 
 		// Fill outputs top-to-bottom until assetTotal consumed
+		// v11 has NO controller output — all filled outputs are asset supply
 		var filled big.Int
 		var filledIdx []int32
 		for i := range tx.Vout {
@@ -723,6 +769,7 @@ func (d *RocksDB) processAssetsCoordinateType(
 		}
 
 		assetTxs = append(assetTxs, assetTxEntry{resolved, btxID, filledIdx})
+		glog.Infof("ASSET-DEBUG Phase2: v11 tx=%s assetTotal=%s filled=%s filledOutputs=%d", tx.Txid, assetTotal.String(), filled.String(), len(filledIdx))
 	}
 
 	// ── Phase 3: Write indexes ─────────────────────────────────
@@ -740,9 +787,12 @@ func (d *RocksDB) processAssetsCoordinateType(
 			for _, u := range bal.Utxos {
 				if u.Vout >= 0 && bytes.Equal(u.Controller, ctrl) && !u.IsController {
 					assetBal.Add(&assetBal, &u.ValueSat)
+					glog.V(1).Infof("ASSET-DEBUG Phase3: counting UTXO vout=%d value=%s", u.Vout, u.ValueSat.String())
 				}
 			}
 		}
+
+		glog.Infof("ASSET-DEBUG Phase3: addr=%s ctrlHex=%s newAssetBal=%s", hex.EncodeToString(addrDesc), hex.EncodeToString(ctrl), assetBal.String())
 
 		// Load existing to carry forward txCount + sentSat
 		existing, _ := d.GetAddrAssetBalance(addrDesc, ctrl)
@@ -893,10 +943,13 @@ func (d *RocksDB) tagUtxoController(
 	glog.Warningf("ASSET-DEBUG tagUtxo: UTXO NOT FOUND vout=%d, bal has %d utxos", vout, len(bal.Utxos))
 }
 
-// lookupSpentController reads controller from a spent UTXO in the DB.
+// lookupSpentController reads controller from a spent UTXO.
+// First checks the in-memory balances map (includes spent UTXOs from current block),
+// then falls back to the DB.
 func (d *RocksDB) lookupSpentController(
 	txid string, vout uint32,
 	txAddressesMap map[string]*TxAddresses,
+	balances map[string]*AddrBalance,
 ) *controllerInfo {
 	btxID, err := d.chainParser.PackTxid(txid)
 	if err != nil {
@@ -906,6 +959,7 @@ func (d *RocksDB) lookupSpentController(
 	if ta == nil {
 		ta, err = d.getTxAddresses(btxID)
 		if err != nil || ta == nil {
+			glog.Warningf("ASSET-DEBUG lookupSpentController: txAddresses not found for txid=%s", txid)
 			return nil
 		}
 	}
@@ -916,18 +970,43 @@ func (d *RocksDB) lookupSpentController(
 	if len(addrDesc) == 0 {
 		return nil
 	}
+
+	// Check in-memory balances first (has Controller set from current or previous blocks)
+	if bal := balances[string(addrDesc)]; bal != nil {
+		for _, u := range bal.Utxos {
+			// Check both spent (Vout < 0, negated by markUtxoAsSpent) and unspent UTXOs
+			actualVout := u.Vout
+			if actualVout < 0 {
+				actualVout = ^actualVout
+			}
+			if actualVout == int32(vout) && bytes.Equal(u.BtxID, btxID) {
+				if len(u.Controller) == 0 {
+					glog.V(1).Infof("ASSET-DEBUG lookupSpentController: UTXO found in memory but no controller, txid=%s vout=%d", txid, vout)
+					continue
+				}
+				glog.V(1).Infof("ASSET-DEBUG lookupSpentController: FOUND in memory txid=%s vout=%d isCtrl=%v", txid, vout, u.IsController)
+				return &controllerInfo{u.Controller, u.IsController}
+			}
+		}
+	}
+
+	// Fallback: read from DB
 	bal, err := d.GetAddrDescBalance(addrDesc, AddressBalanceDetailUTXO)
 	if err != nil || bal == nil {
+		glog.Warningf("ASSET-DEBUG lookupSpentController: DB balance not found for txid=%s vout=%d", txid, vout)
 		return nil
 	}
 	for _, u := range bal.Utxos {
 		if u.Vout == int32(vout) && bytes.Equal(u.BtxID, btxID) {
 			if len(u.Controller) == 0 {
+				glog.Warningf("ASSET-DEBUG lookupSpentController: DB UTXO has no controller txid=%s vout=%d", txid, vout)
 				return nil
 			}
+			glog.V(1).Infof("ASSET-DEBUG lookupSpentController: FOUND in DB txid=%s vout=%d isCtrl=%v", txid, vout, u.IsController)
 			return &controllerInfo{u.Controller, u.IsController}
 		}
 	}
+	glog.Warningf("ASSET-DEBUG lookupSpentController: UTXO NOT FOUND anywhere txid=%s vout=%d", txid, vout)
 	return nil
 }
 
