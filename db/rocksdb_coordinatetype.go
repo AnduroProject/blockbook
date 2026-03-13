@@ -43,6 +43,7 @@ const (
 	addrAssetPrefix     = "aa:"
 	addrAssetTxPrefix   = "ax:"
 	globalAssetTxPrefix = "gt:"
+	reverseAssetPrefix  = "ra:" // assetId (hex) → packed controller
 )
 
 // ---------------------------------------------------------------------------
@@ -279,6 +280,30 @@ func (d *RocksDB) ResolveCurrentController(controller []byte) []byte {
 		current = entry.CurrentController
 	}
 	return current
+}
+
+// GetControllerByAssetId looks up the packed controller for a chain-level assetId.
+// Uses the "ra:" reverse index. Returns nil if not found.
+func (d *RocksDB) GetControllerByAssetId(assetIdHex string) ([]byte, error) {
+	key := append([]byte(reverseAssetPrefix), []byte(assetIdHex)...)
+	val, err := d.db.GetCF(d.ro, d.cfh[cfDefault], key)
+	if err != nil {
+		return nil, err
+	}
+	defer val.Free()
+	if val.Data() == nil {
+		return nil, nil
+	}
+	return append([]byte(nil), val.Data()...), nil
+}
+
+// writeReverseAssetIndex writes the "ra:" reverse index entry.
+func (d *RocksDB) writeReverseAssetIndex(wb *grocksdb.WriteBatch, assetId []byte, controller []byte) {
+	if len(assetId) == 0 {
+		return
+	}
+	key := append([]byte(reverseAssetPrefix), []byte(hex.EncodeToString(assetId))...)
+	wb.PutCF(d.cfh[cfDefault], key, controller)
 }
 
 // ---------------------------------------------------------------------------
@@ -688,9 +713,19 @@ func (d *RocksDB) processAssetsCoordinateType(
 		packed := d.packAssetRegistryEntry(entry)
 		glog.Infof("ASSET-DEBUG Phase1: regKey=%s packedLen=%d", hex.EncodeToString(regKey), len(packed))
 		wb.PutCF(d.cfh[cfDefault], regKey, packed)
+
+		// Write reverse index: assetId → controller (for Phase 2 vin.AssetId lookups)
+		if len(entry.AssetId) > 0 {
+			d.writeReverseAssetIndex(wb, entry.AssetId, ctrlOut)
+		}
 	}
 
 	// ── Phase 2: v11 ASSET_TRANSFER ────────────────────────────
+	//
+	// Uses vin.AssetId (from Coordinate node) to identify asset inputs.
+	// Looks up controller via reverse index (ra:) or same-block ctrlMap.
+	// This avoids lookupSpentController which fails in BulkConnect because
+	// balances are batched and markUtxoAsSpent loses the original vout.
 
 	for txi := range block.Txs {
 		tx := &block.Txs[txi]
@@ -709,37 +744,44 @@ func (d *RocksDB) processAssetsCoordinateType(
 		var assetTotal big.Int
 		var controller []byte
 
-		// Pass over inputs: find controller, sum asset values
+		// Pass over inputs: use vin.AssetId to identify asset inputs
 		for i := range tx.Vin {
 			vin := &tx.Vin[i]
 			if vin.Txid == "" {
 				continue
 			}
-			ci := ctrlMap[opKey(vin.Txid, vin.Vout)]
-			if ci == nil {
-				ci = d.lookupSpentController(vin.Txid, vin.Vout, txAddressesMap, balances)
-			} else {
-				glog.V(1).Infof("ASSET-DEBUG Phase2: vin[%d] found in ctrlMap, isCtrl=%v", i, ci.IsController)
-			}
-			if ci == nil || len(ci.Controller) == 0 {
-				glog.V(1).Infof("ASSET-DEBUG Phase2: vin[%d] txid=%s vout=%d — NO controller found", i, vin.Txid, vin.Vout)
-				continue
-			}
-			// Sum non-controller asset input values
-			if !ci.IsController {
+
+			if vin.AssetId != "" {
+				// This is an asset input — find controller from reverse index or ctrlMap
+				if controller == nil {
+					// Try same-block ctrlMap first
+					ci := ctrlMap[opKey(vin.Txid, vin.Vout)]
+					if ci != nil {
+						controller = ci.Controller
+						glog.Infof("ASSET-DEBUG Phase2: vin[%d] assetId=%s controller from ctrlMap", i, vin.AssetId)
+					} else {
+						// Look up via reverse index (ra:) — committed per block even in BulkConnect
+						ctrl, err := d.GetControllerByAssetId(vin.AssetId)
+						if err == nil && ctrl != nil {
+							controller = d.ResolveCurrentController(ctrl)
+							glog.Infof("ASSET-DEBUG Phase2: vin[%d] assetId=%s controller from reverse index", i, vin.AssetId)
+						} else {
+							glog.Warningf("ASSET-DEBUG Phase2: vin[%d] assetId=%s — reverse index lookup FAILED", i, vin.AssetId)
+						}
+					}
+				}
+				// Sum asset input value
 				if ta != nil && i < len(ta.Inputs) {
 					assetTotal.Add(&assetTotal, &ta.Inputs[i].ValueSat)
 					glog.Infof("ASSET-DEBUG Phase2: vin[%d] asset input value=%s runningTotal=%s", i, ta.Inputs[i].ValueSat.String(), assetTotal.String())
 				}
 			} else {
-				glog.Infof("ASSET-DEBUG Phase2: vin[%d] is CONTROLLER input, skipping value", i)
+				glog.V(1).Infof("ASSET-DEBUG Phase2: vin[%d] is CBTC input (no assetId)", i)
 			}
-			if controller == nil {
-				controller = ci.Controller
-			}
-			// Track input address
-			if ta != nil && i < len(ta.Inputs) && len(ta.Inputs[i].AddrDesc) > 0 {
-				affected[addrAssetKey{string(ta.Inputs[i].AddrDesc), string(ci.Controller)}] = true
+
+			// Track input address for asset balance updates
+			if controller != nil && ta != nil && i < len(ta.Inputs) && len(ta.Inputs[i].AddrDesc) > 0 {
+				affected[addrAssetKey{string(ta.Inputs[i].AddrDesc), string(controller)}] = true
 			}
 		}
 

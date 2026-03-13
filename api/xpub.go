@@ -527,6 +527,12 @@ func (w *Worker) GetXpubAddress(xpub string, page int, txsOnPage int, option Acc
 		filtered = true
 	}
 	addresses := w.newAddressesMapForAliases()
+	// unconfirmed asset balance deltas (keyed by assetId)
+	type unconfirmedAssetDelta struct {
+		sending   big.Int
+		receiving big.Int
+	}
+	unconfirmedAssetDeltas := make(map[string]*unconfirmedAssetDelta)
 	// process mempool, only if ToHeight is not specified
 	if filter.ToHeight == 0 && !filter.OnlyConfirmed {
 		txmMap = make(map[string]*Tx)
@@ -555,8 +561,23 @@ func (w *Worker) GetXpubAddress(xpub string, page int, txsOnPage int, option Acc
 						if !foundTx {
 							unconfirmedTxs++
 						}
-						uBalSat.Add(&uBalSat, tx.getAddrVoutValue(ad.addrDesc))
-						uBalSat.Sub(&uBalSat, tx.getAddrVinValue(ad.addrDesc))
+						if w.db.IsAssetAware() && (tx.Version == 10 || tx.Version == 11) {
+							deltas := getCoordinateMempoolDeltas(tx, ad.addrDesc)
+							uBalSat.Add(&uBalSat, &deltas.cbtcReceiving)
+							uBalSat.Sub(&uBalSat, &deltas.cbtcSending)
+							if deltas.assetController != "" {
+								uad, exists := unconfirmedAssetDeltas[deltas.assetController]
+								if !exists {
+									uad = &unconfirmedAssetDelta{}
+									unconfirmedAssetDeltas[deltas.assetController] = uad
+								}
+								uad.sending.Add(&uad.sending, &deltas.assetSending)
+								uad.receiving.Add(&uad.receiving, &deltas.assetReceiving)
+							}
+						} else {
+							uBalSat.Add(&uBalSat, tx.getAddrVoutValue(ad.addrDesc))
+							uBalSat.Sub(&uBalSat, tx.getAddrVinValue(ad.addrDesc))
+						}
 						// mempool txs are returned only on the first page, uniquely and filtered
 						if page == 0 && !foundTx && (txidFilter == nil || txidFilter(&txid, ad)) {
 							mempoolEntries = append(mempoolEntries, bchain.MempoolTxidEntry{Txid: txid.txid, Time: uint32(tx.Blocktime)})
@@ -688,6 +709,26 @@ func (w *Worker) GetXpubAddress(xpub string, page int, txsOnPage int, option Acc
 	assetTokens := w.xpubAggregateAssetTokens(data, option, filter)
 	if len(assetTokens) > 0 {
 		tokens = append(tokens, assetTokens...)
+	}
+	// Apply unconfirmed asset balance deltas to token list
+	if len(unconfirmedAssetDeltas) > 0 && len(tokens) > 0 {
+		for i := range tokens {
+			t := &tokens[i]
+			if t.Standard != bchain.CoordinateAssetStandard || t.AssetId == "" {
+				continue
+			}
+			ad, exists := unconfirmedAssetDeltas[t.AssetId]
+			if !exists || t.BalanceSat == nil {
+				continue
+			}
+			adjusted := new(big.Int).Set((*big.Int)(t.BalanceSat))
+			adjusted.Add(adjusted, &ad.receiving)
+			adjusted.Sub(adjusted, &ad.sending)
+			if adjusted.Sign() < 0 {
+				adjusted.SetInt64(0)
+			}
+			t.BalanceSat = (*Amount)(adjusted)
+		}
 	}
 	var totalReceived big.Int
 	totalReceived.Add(&data.balanceSat, &data.sentSat)

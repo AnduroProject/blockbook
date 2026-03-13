@@ -864,6 +864,123 @@ func (t *Tx) getAddrVinValue(addrDesc bchain.AddressDescriptor) *big.Int {
 	return &val
 }
 
+// coordinateVinAssetInfo holds parsed vin assetid info from CoinSpecificData.
+type coordinateVinAssetInfo struct {
+	AssetId string
+}
+
+// parseCoordinateVinAssetIds extracts assetid from CoinSpecificData for each vin.
+// Returns a slice matching tx.Vin indices. Empty assetid = CBTC input.
+func parseCoordinateVinAssetIds(tx *Tx) []coordinateVinAssetInfo {
+	if tx.CoinSpecificData == nil || len(tx.CoinSpecificData) == 0 {
+		return nil
+	}
+	var raw struct {
+		Vin []struct {
+			AssetId string `json:"assetid"`
+		} `json:"vin"`
+	}
+	if err := json.Unmarshal(tx.CoinSpecificData, &raw); err != nil {
+		return nil
+	}
+	result := make([]coordinateVinAssetInfo, len(raw.Vin))
+	for i := range raw.Vin {
+		result[i].AssetId = raw.Vin[i].AssetId
+	}
+	return result
+}
+
+// coordinateMempoolAssetDeltas holds separated CBTC and asset balance deltas
+// for a single mempool tx relative to one address.
+type coordinateMempoolAssetDeltas struct {
+	cbtcSending   big.Int
+	cbtcReceiving big.Int
+	assetSending  big.Int // per asset controller
+	assetReceiving big.Int
+	assetController string // controller outpoint string for this tx's asset
+}
+
+// getCoordinateMempoolDeltas computes separated CBTC and asset balance deltas
+// for a v10/v11 mempool tx relative to one address.
+func getCoordinateMempoolDeltas(tx *Tx, addrDesc bchain.AddressDescriptor) *coordinateMempoolAssetDeltas {
+	d := &coordinateMempoolAssetDeltas{}
+	vinAssetIds := parseCoordinateVinAssetIds(tx)
+
+	if tx.Version == 10 {
+		// v10 ASSET_CREATE:
+		// vout[0] = controller, vout[1] = supply, vout[2+] = CBTC change
+		// All vins are CBTC (spending coins to create asset)
+		for _, vin := range tx.Vin {
+			if bytes.Equal(vin.AddrDesc, addrDesc) && vin.ValueSat != nil {
+				d.cbtcSending.Add(&d.cbtcSending, (*big.Int)(vin.ValueSat))
+			}
+		}
+		// Only vout[2+] are CBTC
+		for i, vout := range tx.Vout {
+			if i <= 1 {
+				continue
+			}
+			if bytes.Equal(vout.AddrDesc, addrDesc) && vout.ValueSat != nil {
+				d.cbtcReceiving.Add(&d.cbtcReceiving, (*big.Int)(vout.ValueSat))
+			}
+		}
+		return d
+	}
+
+	if tx.Version == 11 {
+		// v11 ASSET_TRANSFER:
+		// Compute asset input total from vins with assetid
+		var assetInputTotal big.Int
+		for i, vin := range tx.Vin {
+			isAssetVin := false
+			if i < len(vinAssetIds) && vinAssetIds[i].AssetId != "" {
+				isAssetVin = true
+				if d.assetController == "" {
+					// Use the first vin's txid:vout as the controller for lookups
+					// The actual controller is tracked in the registry
+					d.assetController = vinAssetIds[i].AssetId
+				}
+			}
+			if vin.ValueSat == nil {
+				continue
+			}
+			if bytes.Equal(vin.AddrDesc, addrDesc) {
+				if isAssetVin {
+					d.assetSending.Add(&d.assetSending, (*big.Int)(vin.ValueSat))
+				} else {
+					d.cbtcSending.Add(&d.cbtcSending, (*big.Int)(vin.ValueSat))
+				}
+			}
+			if isAssetVin {
+				assetInputTotal.Add(&assetInputTotal, (*big.Int)(vin.ValueSat))
+			}
+		}
+
+		// Fill outputs top-to-bottom until assetInputTotal consumed
+		var filled big.Int
+		for _, vout := range tx.Vout {
+			isAssetVout := false
+			if assetInputTotal.Sign() > 0 && filled.Cmp(&assetInputTotal) < 0 {
+				isAssetVout = true
+				if vout.ValueSat != nil {
+					filled.Add(&filled, (*big.Int)(vout.ValueSat))
+				}
+			}
+			if vout.ValueSat == nil || !bytes.Equal(vout.AddrDesc, addrDesc) {
+				continue
+			}
+			if isAssetVout {
+				d.assetReceiving.Add(&d.assetReceiving, (*big.Int)(vout.ValueSat))
+			} else {
+				d.cbtcReceiving.Add(&d.cbtcReceiving, (*big.Int)(vout.ValueSat))
+			}
+		}
+		return d
+	}
+
+	return d
+}
+
 // GetUniqueTxids removes duplicate transactions
 func GetUniqueTxids(txids []string) []string {
 	ut := make([]string, len(txids))
@@ -1441,6 +1558,12 @@ func (w *Worker) GetAddress(address string, page int, txsOnPage int, option Acco
 		page = 0
 	}
 	addresses := w.newAddressesMapForAliases()
+	// unconfirmed asset balance deltas (keyed by assetId from coinSpecificData)
+	type unconfirmedAssetDelta struct {
+		sending   big.Int
+		receiving big.Int
+	}
+	unconfirmedAssetDeltas := make(map[string]*unconfirmedAssetDelta)
 	// process mempool, only if toHeight is not specified
 	if filter.ToHeight == 0 && !filter.OnlyConfirmed {
 		txm, err = w.getAddressTxids(addrDesc, true, filter, maxInt)
@@ -1456,12 +1579,29 @@ func (w *Worker) GetAddress(address string, page int, txsOnPage int, option Acco
 				// skip already confirmed txs, mempool may be out of sync
 				if tx.Confirmations == 0 {
 					unconfirmedTxs++
-					uBalReceiving.Add(&uBalReceiving, tx.getAddrVoutValue(addrDesc))
-					// ethereum has a different logic - value not in input and add maximum possible fees
-					if w.chainType == bchain.ChainEthereumType {
-						uBalSending.Add(&uBalSending, tx.getAddrEthereumTypeMempoolInputValue(addrDesc))
+					if w.db.IsAssetAware() && (tx.Version == 10 || tx.Version == 11) {
+						// Compute separated CBTC and asset deltas
+						deltas := getCoordinateMempoolDeltas(tx, addrDesc)
+						uBalReceiving.Add(&uBalReceiving, &deltas.cbtcReceiving)
+						uBalSending.Add(&uBalSending, &deltas.cbtcSending)
+						// Track per-asset unconfirmed delta
+						if deltas.assetController != "" {
+							ad, exists := unconfirmedAssetDeltas[deltas.assetController]
+							if !exists {
+								ad = &unconfirmedAssetDelta{}
+								unconfirmedAssetDeltas[deltas.assetController] = ad
+							}
+							ad.sending.Add(&ad.sending, &deltas.assetSending)
+							ad.receiving.Add(&ad.receiving, &deltas.assetReceiving)
+						}
 					} else {
-						uBalSending.Add(&uBalSending, tx.getAddrVinValue(addrDesc))
+						uBalReceiving.Add(&uBalReceiving, tx.getAddrVoutValue(addrDesc))
+						// ethereum has a different logic - value not in input and add maximum possible fees
+						if w.chainType == bchain.ChainEthereumType {
+							uBalSending.Add(&uBalSending, tx.getAddrEthereumTypeMempoolInputValue(addrDesc))
+						} else {
+							uBalSending.Add(&uBalSending, tx.getAddrVinValue(addrDesc))
+						}
 					}
 					if page == 0 {
 						if option == AccountDetailsTxidHistory {
@@ -1567,6 +1707,28 @@ func (w *Worker) GetAddress(address string, page int, txsOnPage int, option Acco
 		assetTokens, _, err := w.getCoordinateAssetData(addrDesc, option, filter)
 		if err == nil && len(assetTokens) > 0 {
 			r.Tokens = assetTokens
+		}
+	}
+
+	// Apply unconfirmed asset balance deltas to token list
+	if len(unconfirmedAssetDeltas) > 0 && len(r.Tokens) > 0 {
+		for i := range r.Tokens {
+			t := &r.Tokens[i]
+			if t.Standard != bchain.CoordinateAssetStandard || t.AssetId == "" {
+				continue
+			}
+			ad, exists := unconfirmedAssetDeltas[t.AssetId]
+			if !exists || t.BalanceSat == nil {
+				continue
+			}
+			// Compute adjusted balance: confirmed + (receiving - sending)
+			adjusted := new(big.Int).Set((*big.Int)(t.BalanceSat))
+			adjusted.Add(adjusted, &ad.receiving)
+			adjusted.Sub(adjusted, &ad.sending)
+			if adjusted.Sign() < 0 {
+				adjusted.SetInt64(0)
+			}
+			t.BalanceSat = (*Amount)(adjusted)
 		}
 	}
 	
@@ -2951,33 +3113,64 @@ func (w *Worker) tagMempoolAssetUtxo(tx *bchain.Tx, voutIdx int, utxo *Utxo) {
 			}
 		}
 	} else if tx.Version == 11 {
-		// ASSET_TRANSFER: no controller output in v11
-		// For mempool, tag output with controller + assetId for wallet use
-		ctrl := w.findAssetControllerFromInputs(tx)
-		if ctrl != "" {
-			utxo.Controller = ctrl
-			utxo.IsController = false
-			// Look up chain-level asset ID from registry
-			ctrlBytes, err := w.db.ParseControllerString(ctrl)
-			if err == nil && ctrlBytes != nil {
-				resolved := w.db.ResolveCurrentController(ctrlBytes)
-				entry, err := w.db.GetAssetRegistryEntry(resolved)
-				if err == nil && entry != nil && !entry.IsRedirect && len(entry.AssetId) > 0 {
-					utxo.AssetId = db.FormatAssetId(entry.AssetId)
-				}
+		// ASSET_TRANSFER: only tag outputs within the asset fill range.
+		// Get assetId from vin, look up prev tx values to compute fill range.
+		var assetIdHex string
+		var assetTotal big.Int
+		for i := range tx.Vin {
+			if tx.Vin[i].AssetId == "" || tx.Vin[i].Txid == "" {
+				continue
+			}
+			if assetIdHex == "" {
+				assetIdHex = tx.Vin[i].AssetId
+			}
+			// Look up the spent output value from the previous tx
+			prevTx, _, err := w.txCache.GetTransaction(tx.Vin[i].Txid)
+			if err == nil && prevTx != nil && int(tx.Vin[i].Vout) < len(prevTx.Vout) {
+				assetTotal.Add(&assetTotal, &prevTx.Vout[tx.Vin[i].Vout].ValueSat)
+			}
+		}
+
+		if assetIdHex == "" || assetTotal.Sign() == 0 {
+			return
+		}
+
+		// Check if this voutIdx falls within the fill range
+		var filled big.Int
+		isAssetOutput := false
+		for i := 0; i < len(tx.Vout); i++ {
+			if filled.Cmp(&assetTotal) >= 0 {
+				break
+			}
+			if i == voutIdx {
+				isAssetOutput = true
+			}
+			filled.Add(&filled, &tx.Vout[i].ValueSat)
+		}
+
+		if isAssetOutput {
+			ctrl := w.findAssetControllerFromInputs(tx)
+			if ctrl != "" {
+				utxo.Controller = ctrl
+				utxo.IsController = false
+				utxo.AssetId = assetIdHex
 			}
 		}
 	}
 }
 
 // findAssetControllerFromInputs looks up the controller outpoint from the
-// inputs of an ASSET_TRANSFER tx. It first checks vin.AssetId (populated by
-// the parser from the daemon JSON), then falls back to a DB UTXO lookup.
+// inputs of an ASSET_TRANSFER tx. Uses vin.AssetId + reverse index (ra:)
+// to resolve the controller outpoint string ("txid:0" format).
 func (w *Worker) findAssetControllerFromInputs(tx *bchain.Tx) string {
-	// Fast path: parser may have set AssetId from daemon JSON
+	// Fast path: use vin.AssetId + reverse index to get controller
 	for i := range tx.Vin {
 		if tx.Vin[i].AssetId != "" {
-			return tx.Vin[i].AssetId
+			ctrl, err := w.db.GetControllerByAssetId(tx.Vin[i].AssetId)
+			if err == nil && ctrl != nil {
+				resolved := w.db.ResolveCurrentController(ctrl)
+				return w.db.FormatControllerOutpoint(resolved)
+			}
 		}
 	}
 	// Slow path: look up confirmed UTXO in DB
