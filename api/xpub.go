@@ -360,6 +360,9 @@ func (w *Worker) xpubAggregateAssetTokens(data *xpubData, option AccountDetails,
 			if len(entry.AssetId) > 0 {
 				t.AssetId = db.FormatAssetId(entry.AssetId)
 			}
+			if entry.PayloadData != "" {
+				t.ImageURL = extractImageURLFromPayload(entry.PayloadData)
+			}
 		}
 		tokens = append(tokens, t)
 	}

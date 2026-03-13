@@ -139,6 +139,7 @@ type AssetRegistryEntry struct {
 	CurrentController []byte
 	IsRedirect        bool
 	AssetId           []byte // 11 bytes: 8-byte block height (BE) + 3-byte ASCII index ("001")
+	PayloadData       string // raw JSON string from payloaddata field (e.g. {"image_url":"..."})
 }
 
 // CreateAssetId builds the 11-byte asset identifier matching Coordinate Core:
@@ -192,6 +193,10 @@ func (d *RocksDB) packAssetRegistryEntry(e *AssetRegistryEntry) []byte {
 	l = packVaruint(uint(len(e.AssetId)), varBuf[:])
 	buf = append(buf, varBuf[:l]...)
 	buf = append(buf, e.AssetId...)
+	// payloadData
+	l = packVaruint(uint(len(e.PayloadData)), varBuf[:])
+	buf = append(buf, varBuf[:l]...)
+	buf = append(buf, []byte(e.PayloadData)...)
 	return buf
 }
 
@@ -238,6 +243,15 @@ func (d *RocksDB) unpackAssetRegistryEntry(data []byte) (*AssetRegistryEntry, er
 		p += l
 		if aidLen > 0 && p+int(aidLen) <= len(data) {
 			e.AssetId = append([]byte(nil), data[p:p+int(aidLen)]...)
+			p += int(aidLen)
+		}
+	}
+	// payloadData (may not exist in old data)
+	if p < len(data) {
+		pdLen, l := unpackVaruint(data[p:])
+		p += l
+		if pdLen > 0 && p+int(pdLen) <= len(data) {
+			e.PayloadData = string(data[p : p+int(pdLen)])
 		}
 	}
 	return e, nil
@@ -690,6 +704,7 @@ func (d *RocksDB) processAssetsCoordinateType(
 				entry.Precision = oldEntry.Precision
 				entry.AssetType = oldEntry.AssetType
 				entry.AssetId = oldEntry.AssetId // keep original asset ID
+				entry.PayloadData = oldEntry.PayloadData
 				entry.TotalSupply.Add(&oldEntry.TotalSupply, supply)
 			} else {
 				entry.TotalSupply.Set(supply)
@@ -1119,13 +1134,14 @@ func (d *RocksDB) fillAssetMetadataFromTx(tx *bchain.Tx, entry *AssetRegistryEnt
 	}
 	glog.Infof("ASSET-DEBUG fillMetadata: raw JSON len=%d, first100=%s", len(raw), preview)
 	var fields struct {
-		Ticker    string `json:"ticker"`
-		Headline  string `json:"headline"`
-		Precision int32  `json:"precision"`
-		AssetType int32  `json:"assettype"`
+		Ticker      string `json:"ticker"`
+		Headline    string `json:"headline"`
+		Precision   int32  `json:"precision"`
+		AssetType   int32  `json:"assettype"`
+		PayloadData string `json:"payloaddata"`
 	}
 	if err := json.Unmarshal(raw, &fields); err == nil {
-		glog.Infof("ASSET-DEBUG fillMetadata: parsed ticker=%q headline=%q precision=%d assetType=%d", fields.Ticker, fields.Headline, fields.Precision, fields.AssetType)
+		glog.Infof("ASSET-DEBUG fillMetadata: parsed ticker=%q headline=%q precision=%d assetType=%d payloaddata=%q", fields.Ticker, fields.Headline, fields.Precision, fields.AssetType, fields.PayloadData)
 		if fields.Ticker != "" {
 			entry.Ticker = fields.Ticker
 		}
@@ -1135,6 +1151,9 @@ func (d *RocksDB) fillAssetMetadataFromTx(tx *bchain.Tx, entry *AssetRegistryEnt
 		// Always set precision — 0 is valid (e.g. NFTs)
 		entry.Precision = fields.Precision
 		entry.AssetType = fields.AssetType
+		if fields.PayloadData != "" {
+			entry.PayloadData = fields.PayloadData
+		}
 	} else {
 		glog.Warningf("ASSET-DEBUG fillMetadata: json.Unmarshal FAILED: %v", err)
 	}

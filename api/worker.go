@@ -1019,6 +1019,39 @@ func (w *Worker) resolveContractToAssetId(contract string) string {
 	return db.FormatAssetId(entry.AssetId)
 }
 
+// extractImageURLFromPayload extracts the image_url from a payloaddata string.
+// payloaddata is NOT guaranteed to be JSON — it can be arbitrary text, a number,
+// an array, or malformed data. Returns "" if parsing fails or no valid URL found.
+func extractImageURLFromPayload(payloadData string) string {
+	if payloadData == "" {
+		return ""
+	}
+	// Quick sanity check: must look like a JSON object
+	trimmed := strings.TrimSpace(payloadData)
+	if len(trimmed) < 2 || trimmed[0] != '{' {
+		return ""
+	}
+	// Try to parse as a generic map first — handles arrays, strings, numbers
+	// that would confuse struct unmarshalling in edge cases
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &m); err != nil {
+		return ""
+	}
+	val, ok := m["image_url"]
+	if !ok {
+		return ""
+	}
+	url, ok := val.(string)
+	if !ok || url == "" {
+		return ""
+	}
+	// Basic URL validation — must start with http:// or https://
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		return ""
+	}
+	return url
+}
+
 // GetUniqueTxids removes duplicate transactions
 func GetUniqueTxids(txids []string) []string {
 	ut := make([]string, len(txids))
@@ -2978,6 +3011,9 @@ func (w *Worker) getCoordinateAssetData(
             if len(entry.AssetId) > 0 {
                 t.AssetId = db.FormatAssetId(entry.AssetId)
             }
+            if entry.PayloadData != "" {
+                t.ImageURL = extractImageURLFromPayload(entry.PayloadData)
+            }
         }
 
         tokens = append(tokens, t)
@@ -3063,6 +3099,9 @@ func (w *Worker) GetAsset(controller string, page, txsOnPage int, option Account
         r.TotalSupply = (*Amount)(&entry.TotalSupply)
         if len(entry.AssetId) > 0 {
             r.AssetId = db.FormatAssetId(entry.AssetId)
+        }
+        if entry.PayloadData != "" {
+            r.ImageURL = extractImageURLFromPayload(entry.PayloadData)
         }
     }
 

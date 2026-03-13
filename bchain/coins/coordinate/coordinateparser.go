@@ -118,10 +118,11 @@ type CoordinateTx struct {
 	Time          int64            `json:"time,omitempty"`
 	Blocktime     int64            `json:"blocktime,omitempty"`
 	// v10 ASSET_CREATE metadata fields
-	Precision int32  `json:"precision,omitempty"`
-	AssetType int32  `json:"assettype,omitempty"`
-	Ticker    string `json:"ticker,omitempty"`
-	Headline  string `json:"headline,omitempty"`
+	Precision   int32  `json:"precision,omitempty"`
+	AssetType   int32  `json:"assettype,omitempty"`
+	Ticker      string `json:"ticker,omitempty"`
+	Headline    string `json:"headline,omitempty"`
+	PayloadData string `json:"payloaddata,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

@@ -186,6 +186,7 @@ type Token struct {
 	Decimals         int                      `json:"decimals,omitempty" ts_doc:"Number of decimals for this token."`
 	AssetType        int                      `json:"assetType,omitempty" ts_doc:"Asset type for Coordinate assets (0=not set)."`
 	AssetId          string                   `json:"assetId,omitempty" ts_doc:"Chain-level asset identifier (hex) for Coordinate assets."`
+	ImageURL         string                   `json:"imageUrl,omitempty" ts_doc:"Image URL from asset payloaddata (for NFTs and tokens with metadata)."`
 	BalanceSat       *Amount                  `json:"balance,omitempty" ts_doc:"Current token balance (in minimal base units)."`
 	BaseValue        float64                  `json:"baseValue,omitempty" ts_doc:"Value in the base currency (e.g. ETH for ERC20 tokens)."`
 	SecondaryValue   float64                  `json:"secondaryValue,omitempty" ts_doc:"Value in a secondary currency (e.g. fiat), if available."`
@@ -408,6 +409,7 @@ type AssetInfo struct {
 	Headline     string   `json:"headline,omitempty"`
 	Precision    int      `json:"precision"`
 	AssetType    int      `json:"assetType"`
+	ImageURL     string   `json:"imageUrl,omitempty"`
 	TotalSupply  *Amount  `json:"totalSupply,omitempty"`
 	Txs          int      `json:"txs"`
 	UnconfirmedTxs int    `json:"unconfirmedTxs,omitempty"`
