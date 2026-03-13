@@ -537,6 +537,11 @@ func (w *Worker) GetXpubAddress(xpub string, page int, txsOnPage int, option Acc
 	if filter.ToHeight == 0 && !filter.OnlyConfirmed {
 		txmMap = make(map[string]*Tx)
 		mempoolEntries := make(bchain.MempoolTxidEntries, 0)
+		// Resolve contract filter to assetId for mempool tx filtering
+		var filterAssetId string
+		if w.db.IsAssetAware() && filter.Contract != "" {
+			filterAssetId = w.resolveContractToAssetId(filter.Contract)
+		}
 		for _, da := range data.addresses {
 			for i := range da {
 				ad := &da[i]
@@ -579,7 +584,8 @@ func (w *Worker) GetXpubAddress(xpub string, page int, txsOnPage int, option Acc
 							uBalSat.Sub(&uBalSat, tx.getAddrVinValue(ad.addrDesc))
 						}
 						// mempool txs are returned only on the first page, uniquely and filtered
-						if page == 0 && !foundTx && (txidFilter == nil || txidFilter(&txid, ad)) {
+						if page == 0 && !foundTx && (txidFilter == nil || txidFilter(&txid, ad)) &&
+							(filterAssetId == "" || mempoolTxMatchesAssetFilter(tx, filterAssetId, filter.Contract)) {
 							mempoolEntries = append(mempoolEntries, bchain.MempoolTxidEntry{Txid: txid.txid, Time: uint32(tx.Blocktime)})
 						}
 					}

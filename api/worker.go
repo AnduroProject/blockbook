@@ -981,6 +981,44 @@ func getCoordinateMempoolDeltas(tx *Tx, addrDesc bchain.AddressDescriptor) *coor
 	return d
 }
 
+// mempoolTxMatchesAssetFilter checks whether a mempool transaction involves the
+// asset identified by filterAssetId (hex-encoded 11-byte ID from the registry)
+// or, for v10 asset-creation txs, whether filterContract matches txid:0.
+// Non-asset transactions (version != 10/11) never match.
+func mempoolTxMatchesAssetFilter(tx *Tx, filterAssetId string, filterContract string) bool {
+	if tx.Version == 10 {
+		// v10 ASSET_CREATE: the controller outpoint is txid:0
+		return filterContract == tx.Txid+":0"
+	}
+	if tx.Version == 11 {
+		// v11 ASSET_TRANSFER: compare assetid from vin against the resolved filter
+		vinAssetIds := parseCoordinateVinAssetIds(tx)
+		for _, v := range vinAssetIds {
+			if v.AssetId != "" && v.AssetId == filterAssetId {
+				return true
+			}
+		}
+		return false
+	}
+	// Regular (non-asset) tx never matches an asset filter
+	return false
+}
+
+// resolveContractToAssetId resolves a controller outpoint string (e.g. "txid:0")
+// to its hex-encoded assetId via the asset registry. Returns "" if unresolvable.
+func (w *Worker) resolveContractToAssetId(contract string) string {
+	ctrl, err := w.db.ParseControllerString(contract)
+	if err != nil || ctrl == nil {
+		return ""
+	}
+	resolved := w.db.ResolveCurrentController(ctrl)
+	entry, err := w.db.GetAssetRegistryEntry(resolved)
+	if err != nil || entry == nil || len(entry.AssetId) == 0 {
+		return ""
+	}
+	return db.FormatAssetId(entry.AssetId)
+}
+
 // GetUniqueTxids removes duplicate transactions
 func GetUniqueTxids(txids []string) []string {
 	ut := make([]string, len(txids))
@@ -1570,6 +1608,11 @@ func (w *Worker) GetAddress(address string, page int, txsOnPage int, option Acco
 		if err != nil {
 			return nil, errors.Annotatef(err, "getAddressTxids %v true", addrDesc)
 		}
+		// Resolve contract filter to assetId for mempool tx filtering
+		var filterAssetId string
+		if w.db.IsAssetAware() && filter.Contract != "" {
+			filterAssetId = w.resolveContractToAssetId(filter.Contract)
+		}
 		for _, txid := range txm {
 			tx, err := w.getTransaction(txid, false, true, addresses)
 			// mempool transaction may fail
@@ -1603,7 +1646,7 @@ func (w *Worker) GetAddress(address string, page int, txsOnPage int, option Acco
 							uBalSending.Add(&uBalSending, tx.getAddrVinValue(addrDesc))
 						}
 					}
-					if page == 0 {
+					if page == 0 && (filterAssetId == "" || mempoolTxMatchesAssetFilter(tx, filterAssetId, filter.Contract)) {
 						if option == AccountDetailsTxidHistory {
 							txids = append(txids, tx.Txid)
 						} else if option >= AccountDetailsTxHistoryLight {
