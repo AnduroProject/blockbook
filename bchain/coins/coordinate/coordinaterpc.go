@@ -2,6 +2,7 @@ package coordinate
 
 import (
 	"encoding/json"
+	"math/big"
 	"strings"
 
 	"github.com/golang/glog"
@@ -199,6 +200,11 @@ func (b *CoordinateRPC) GetBlock(hash string, height uint32) (*bchain.Block, err
 	}
 
 	// 2. Preconf (signed block) transactions
+	// For v9 txs, correct vout[0] using the node's getpreconftxrefund RPC.
+	// Same-block cache handles chained preconf txs within this block where
+	// the RPC might not have the data yet.
+	preconfRefunds := make(map[string]*big.Int)
+
 	for sbIdx, sb := range res.Result.PreconfBlocks {
 		for txIdx, rawTx := range sb.Txs {
 			tx, err := b.Parser.ParseTxFromJson(rawTx)
@@ -207,6 +213,49 @@ func (b *CoordinateRPC) GetBlock(hash string, height uint32) (*bchain.Block, err
 				continue
 			}
 			tx.CoinSpecificData = rawTx
+
+			if tx.Version == TxVersionPreconf && len(tx.Vout) >= 2 {
+				// Try the node RPC first
+				refund, err := b.getPreconfRefund(tx.Txid)
+				if err == nil && refund >= 0 {
+					tx.Vout[0].ValueSat = *big.NewInt(refund)
+					preconfRefunds[tx.Txid] = big.NewInt(refund)
+					glog.Infof("PRECONF-DEBUG: v9 tx=%s refund=%d (from RPC)", tx.Txid, refund)
+				} else if tx.VSize > 0 {
+					// Fallback: compute manually using sb.Fee
+					var vinTotal big.Int
+					for i := range tx.Vin {
+						if tx.Vin[i].Txid == "" {
+							continue
+						}
+						if tx.Vin[i].Vout == 0 {
+							if cached, ok := preconfRefunds[tx.Vin[i].Txid]; ok {
+								vinTotal.Add(&vinTotal, cached)
+								continue
+							}
+						}
+						prevTx, pErr := b.GetTransaction(tx.Vin[i].Txid)
+						if pErr == nil && prevTx != nil && int(tx.Vin[i].Vout) < len(prevTx.Vout) {
+							vinTotal.Add(&vinTotal, &prevTx.Vout[tx.Vin[i].Vout].ValueSat)
+						}
+					}
+					var voutSum big.Int
+					for i := 1; i < len(tx.Vout); i++ {
+						voutSum.Add(&voutSum, &tx.Vout[i].ValueSat)
+					}
+					actualFee := int64(tx.VSize) * sb.Fee
+					change := new(big.Int).Sub(&vinTotal, &voutSum)
+					change.Sub(change, big.NewInt(actualFee))
+					if change.Sign() >= 0 {
+						tx.Vout[0].ValueSat = *change
+						preconfRefunds[tx.Txid] = new(big.Int).Set(change)
+						glog.Infof("PRECONF-DEBUG: v9 tx=%s refund=%s (computed, sbFee=%d)", tx.Txid, change.String(), sb.Fee)
+					} else {
+						glog.Warningf("PRECONF-DEBUG: v9 tx=%s negative change=%s", tx.Txid, change.String())
+					}
+				}
+			}
+
 			txs = append(txs, *tx)
 		}
 	}
@@ -227,6 +276,67 @@ func (b *CoordinateRPC) GetBlock(hash string, height uint32) (*bchain.Block, err
 		Txs:         txs,
 	}
 	return block, nil
+}
+
+// GetTransaction overrides BitcoinRPC.GetTransaction to correct v9 preconf
+// vout[0] values. The raw tx has the fee RATE in vout[0], but the actual
+// UTXO value is the refund after fee settlement.
+// getPreconfRefund calls the node's getpreconftxrefund RPC to get the correct
+// refund value for a v9 preconf transaction's vout[0].
+func (b *CoordinateRPC) getPreconfRefund(txid string) (int64, error) {
+	type refundReq struct {
+		Method string        `json:"method"`
+		Params []interface{} `json:"params"`
+	}
+	type refundEntry struct {
+		Tx     string `json:"tx"`
+		Refund int64  `json:"refund"`
+	}
+	type refundRes struct {
+		Error  *bchain.RPCError `json:"error"`
+		Result []refundEntry    `json:"result"`
+	}
+	req := refundReq{
+		Method: "getpreconftxrefund",
+		Params: []interface{}{
+			[]map[string]string{{"tx": txid}},
+		},
+	}
+	res := refundRes{}
+	err := b.Call(&req, &res)
+	if err != nil {
+		return 0, err
+	}
+	if res.Error != nil {
+		return 0, res.Error
+	}
+	if len(res.Result) > 0 {
+		return res.Result[0].Refund, nil
+	}
+	return 0, errors.New("empty result from getpreconftxrefund")
+}
+
+// GetTransaction overrides BitcoinRPC.GetTransaction to correct v9 preconf
+// vout[0] values. The raw tx has the fee RATE in vout[0], but the actual
+// UTXO value is the refund after fee settlement.
+func (b *CoordinateRPC) GetTransaction(txid string) (*bchain.Tx, error) {
+	tx, err := b.BitcoinRPC.GetTransaction(txid)
+	if err != nil || tx == nil {
+		return tx, err
+	}
+	// Only correct confirmed v9 txs
+	if tx.Version != TxVersionPreconf || len(tx.Vout) < 2 || tx.Confirmations == 0 {
+		return tx, nil
+	}
+	// Ask the node for the correct refund value
+	refund, err := b.getPreconfRefund(txid)
+	if err != nil {
+		glog.Warningf("PRECONF-DEBUG: getPreconfRefund failed for tx=%s: %v", txid, err)
+		return tx, nil
+	}
+	tx.Vout[0].ValueSat = *big.NewInt(refund)
+	glog.V(1).Infof("PRECONF-DEBUG: corrected vout[0] for tx=%s refund=%d", txid, refund)
+	return tx, nil
 }
 
 func (b *CoordinateRPC) GetTransactionForMempool(txid string) (*bchain.Tx, error) {
