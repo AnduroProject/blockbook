@@ -1,9 +1,9 @@
 {
     "coin": {
-        "name": "Coordinate Testnet",
+        "name": "Coordinate Testnet4",
         "shortcut": "tBTC",
-        "label": "Coordinate Testnet",
-        "alias": "coordinate_testnet"
+        "label": "Coordinate Testnet4",
+        "alias": "coordinate_testnet4"
     },
     "ports": {
         "backend_rpc": 18443,
